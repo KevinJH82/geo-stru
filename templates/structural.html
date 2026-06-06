@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>地质构造解译系统</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', 'Microsoft YaHei', sans-serif; background: #f1f5f9; }
+        .upload-zone {
+            border: 2px dashed #cbd5e1; border-radius: 12px; padding: 20px;
+            text-align: center; cursor: pointer; transition: all .2s;
+            background: #fafbfc;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: #3b82f6; background: #eff6ff;
+        }
+        .upload-zone.uploaded {
+            border-color: #10b981; background: #ecfdf5;
+        }
+        .upload-zone.uploading {
+            border-color: #f59e0b; background: #fffbeb;
+        }
+        .upload-zone .zone-icon { font-size: 28px; margin-bottom: 6px; }
+        .upload-zone .zone-title { font-size: .85rem; font-weight: 500; color: #475569; }
+        .upload-zone .zone-hint { font-size: .72rem; color: #94a3b8; margin-top: 4px; }
+        .upload-zone.uploaded .zone-title { color: #059669; }
+        .data-tag {
+            display: inline-flex; align-items: center; gap: 4px;
+            padding: 2px 8px; border-radius: 6px; font-size: .7rem; font-weight: 500;
+            margin: 2px;
+        }
+        .data-tag.ok { background: #dcfce7; color: #166534; }
+        .data-tag.missing { background: #fee2e2; color: #991b1b; }
+        .log-box {
+            background: #0f172a; color: #94a3b8; border-radius: 10px;
+            padding: 14px; max-height: 280px; overflow-y: auto;
+            font-family: 'Consolas','Monaco',monospace; font-size: .78rem;
+            line-height: 1.6;
+        }
+        .log-box::-webkit-scrollbar { width: 4px; }
+        .log-box::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        .log-entry.info { color: #60a5fa; }
+        .log-entry.warning { color: #fbbf24; }
+        .log-entry.error { color: #f87171; }
+        .log-entry.success { color: #34d399; }
+        .tab-btn { padding: 8px 20px; border-bottom: 2px solid transparent; cursor: pointer;
+                   font-size: .9rem; color: #64748b; transition: all .15s; }
+        .tab-btn:hover { color: #2563eb; }
+        .tab-btn.active { color: #2563eb; border-bottom-color: #2563eb; font-weight: 600; }
+        .img-viewer {
+            display: flex; align-items: center; justify-content: center;
+            min-height: 400px; background: #1e293b; border-radius: 10px;
+            overflow: hidden; position: relative;
+        }
+        .img-viewer img {
+            max-width: 100%; max-height: 70vh; object-fit: contain;
+            transition: transform .2s; cursor: zoom-in;
+        }
+        .img-viewer img.zoomed { cursor: zoom-out; }
+        .progress-track { background: #e2e8f0; border-radius: 999px; height: 8px; overflow: hidden; }
+        .progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg,#3b82f6,#2563eb);
+                         transition: width .4s; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+        .pulse { animation: pulse 1.8s infinite; }
+        .checklist-item { display: flex; align-items: center; gap: 6px; font-size: .75rem; padding: 2px 0; }
+    </style>
+</head>
+<body class="min-h-screen">
+
+<!-- Header -->
+<header class="bg-white border-b border-slate-200 px-6 py-3 flex items-center gap-4 sticky top-0 z-50">
+    <a href="/" class="text-slate-400 hover:text-blue-600 transition">
+        <iconify-icon icon="lucide:arrow-left" width="20"></iconify-icon>
+    </a>
+    <div>
+        <h1 class="text-lg font-bold text-slate-800">地质构造解译系统</h1>
+        <p class="text-xs text-slate-400">上传卫星数据包与区域文件，自动生成山体阴影、坡向分析、地形渲染解译图</p>
+    </div>
+    <div class="ml-auto flex items-center gap-3">
+        <a href="/docs/image-parameters" target="_blank"
+           class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 border border-slate-200 rounded-md px-2.5 py-1.5">
+            <iconify-icon icon="lucide:book-open" width="14"></iconify-icon> 图件参数报告
+        </a>
+        <span id="status_dot" class="inline-block w-2 h-2 rounded-full bg-slate-300"></span>
+        <span id="status_text" class="text-sm text-slate-500">就绪</span>
+    </div>
+</header>
+
+<div class="flex" style="min-height:calc(100vh - 57px)">
+
+    <!-- Sidebar -->
+    <aside class="w-80 bg-white border-r border-slate-200 p-5 flex flex-col gap-4 overflow-y-auto shrink-0">
+
+        <!-- 1. 工作区范围(ROI)-->
+        <section>
+            <h2 class="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-2">
+                <iconify-icon icon="lucide:map-pin" width="15"></iconify-icon> 工作区范围(ROI)
+            </h2>
+            <div id="area_zone" class="upload-zone" onclick="document.getElementById('area_input').click()">
+                <input type="file" id="area_input" accept=".kml,.kmz,.ovkml,.xlsx,.xls,.csv" class="hidden">
+                <iconify-icon icon="lucide:file-up" width="28" class="zone-icon text-slate-400"></iconify-icon>
+                <p class="zone-title">上传 ROI / KML 文件</p>
+                <p class="zone-hint">据此到交付库自动定位卫星数据</p>
+            </div>
+            <div id="area_info" class="mt-2 text-xs hidden">
+                <div id="area_filename" class="text-slate-600 mb-1"></div>
+                <div id="polygon_preview" class="text-emerald-600"></div>
+            </div>
+        </section>
+
+        <!-- 2. 卫星数据(交付库·冬季)-->
+        <section>
+            <h2 class="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-2">
+                <iconify-icon icon="lucide:database" width="15"></iconify-icon> 卫星数据(交付库·冬季)
+            </h2>
+            <label class="text-xs text-slate-500 block mb-1">交付项目</label>
+            <select id="project_select" onchange="onProjectChange()"
+                    class="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none">
+                <option value="">— 上传 ROI 自动定位,或手动选择 —</option>
+            </select>
+            <div id="data_status" class="mt-2 text-xs space-y-0.5 text-slate-400">尚未定位项目</div>
+        </section>
+
+        <hr class="border-slate-100">
+
+        <!-- 3. 参数 -->
+        <section>
+            <h2 class="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-2">
+                <iconify-icon icon="lucide:settings" width="15"></iconify-icon> 参数设置
+            </h2>
+            <div class="space-y-3">
+                <div>
+                    <label class="text-xs text-slate-500 block mb-1">光照方位角</label>
+                    <input id="azimuth" type="number" value="315" min="0" max="360"
+                           class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500 block mb-1">光照高度角</label>
+                    <input id="altitude" type="number" value="30" min="5" max="90"
+                           class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none">
+                </div>
+                <label class="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">
+                    <input id="use_landsat" type="checkbox" checked class="rounded border-slate-300 text-blue-600">
+                    叠加 Landsat 真彩色
+                </label>
+            </div>
+        </section>
+
+        <!-- Actions -->
+        <section class="mt-auto space-y-2">
+            <button id="run_btn" onclick="startGeneration()" disabled
+                class="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-semibold py-2.5 rounded-lg transition flex items-center justify-center gap-2">
+                <iconify-icon icon="lucide:play" width="16"></iconify-icon> 开始生成
+            </button>
+            <button onclick="clearAll()"
+                class="w-full bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 font-medium py-2 rounded-lg transition text-sm">
+                重置
+            </button>
+        </section>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 p-6 flex flex-col gap-5 overflow-y-auto">
+
+        <!-- Progress -->
+        <div id="progress_section" class="hidden">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-sm font-medium text-slate-600">生成进度</span>
+                <span id="progress_pct" class="text-sm text-blue-600 font-semibold">0%</span>
+            </div>
+            <div class="progress-track">
+                <div id="progress_bar" class="progress-fill" style="width:0%"></div>
+            </div>
+        </div>
+
+        <!-- Results -->
+        <div id="results_section" class="hidden">
+            <div class="flex border-b border-slate-200 mb-4">
+                <button class="tab-btn active" data-tab="tab_a" onclick="switchTab(this)">
+                    <iconify-icon icon="lucide:mountain" width="14" class="mr-1"></iconify-icon> 山体阴影
+                </button>
+                <button class="tab-btn" data-tab="tab_b" onclick="switchTab(this)">
+                    <iconify-icon icon="lucide:compass" width="14" class="mr-1"></iconify-icon> 坡向分析
+                </button>
+                <button class="tab-btn" data-tab="tab_c" onclick="switchTab(this)">
+                    <iconify-icon icon="lucide:layers" width="14" class="mr-1"></iconify-icon> 地形渲染
+                </button>
+                <button class="tab-btn" data-tab="tab_d" onclick="switchTab(this)">
+                    <iconify-icon icon="lucide:git-fork" width="14" class="mr-1"></iconify-icon> 构造统计/玫瑰图
+                </button>
+                <button class="tab-btn" data-tab="tab_e" onclick="switchTab(this)">
+                    <iconify-icon icon="lucide:grid-2x2" width="14" class="mr-1"></iconify-icon> 衍生栅格
+                </button>
+            </div>
+            <div id="tab_a" class="tab-content">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm text-slate-500">1:5万山体阴影遥感地质构造解译图</span>
+                    <button onclick="downloadImg('img_a')" class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1">
+                        <iconify-icon icon="lucide:download" width="14"></iconify-icon> 下载
+                    </button>
+                </div>
+                <div class="img-viewer"><img id="img_a" src="" alt="山体阴影图"></div>
+            </div>
+            <div id="tab_b" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm text-slate-500">1:5万坡向分析遥感地质构造解译图</span>
+                    <button onclick="downloadImg('img_b')" class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1">
+                        <iconify-icon icon="lucide:download" width="14"></iconify-icon> 下载
+                    </button>
+                </div>
+                <div class="img-viewer"><img id="img_b" src="" alt="坡向分析图"></div>
+            </div>
+            <div id="tab_c" class="tab-content hidden">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm text-slate-500">1:5万地形渲染遥感地质构造解译图</span>
+                    <button onclick="downloadImg('img_c')" class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1">
+                        <iconify-icon icon="lucide:download" width="14"></iconify-icon> 下载
+                    </button>
+                </div>
+                <div class="img-viewer"><img id="img_c" src="" alt="地形渲染图"></div>
+            </div>
+            <div id="tab_d" class="tab-content hidden">
+                <div class="grid md:grid-cols-2 gap-4">
+                    <div>
+                        <div class="text-sm font-semibold text-slate-700 mb-2">构造统计</div>
+                        <div id="struct_stats" class="text-sm text-slate-600 space-y-1">—</div>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-sm text-slate-500">构造方向玫瑰图</span>
+                            <a id="rose_dl" href="#" class="text-xs text-blue-600 hover:text-blue-800 hidden flex items-center gap-1">
+                                <iconify-icon icon="lucide:download" width="14"></iconify-icon> 下载
+                            </a>
+                        </div>
+                        <div class="img-viewer"><img id="img_rose" src="" alt="玫瑰图"></div>
+                        <div id="rose_empty" class="text-xs text-slate-400 hidden">本区未提取到线性体,无玫瑰图。</div>
+                    </div>
+                </div>
+            </div>
+            <div id="tab_e" class="tab-content hidden">
+                <div class="text-xs text-slate-400 mb-3">
+                    光照无关地形增强 / 二阶地貌量 / 构造邻近度等衍生栅格(GeoTIFF,供下游分析)。预览为套色渲染,下载为原始 GeoTIFF。
+                </div>
+                <div id="deriv_grid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">—</div>
+                <div id="vector_dl" class="mt-4 text-sm"></div>
+            </div>
+        </div>
+
+        <!-- Log -->
+        <div>
+            <h3 class="text-sm font-semibold text-slate-700 mb-2 flex items-center gap-2">
+                <iconify-icon icon="lucide:terminal" width="14"></iconify-icon> 处理日志
+            </h3>
+            <div id="log_box" class="log-box">
+                <div class="log-entry info">系统就绪。上传 ROI 文件后将自动到交付库(冬季)定位 DEM/Landsat，然后开始生成。</div>
+            </div>
+        </div>
+    </main>
+</div>
+
+<script>
+// ==================== State ====================
+let areaFilePath = null;  // 区域文件路径
+let projectName = null;   // 交付库项目名
+let demAvailable = false; // 该项目冬季是否有 DEM
+let taskId = null;
+let pollTimer = null;
+
+// ==================== Zone helpers ====================
+function wireZone(zoneId, inputId, handler) {
+    const zone = document.getElementById(zoneId);
+    const input = document.getElementById(inputId);
+    ['dragover','dragenter'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.add('dragover'); }));
+    ['dragleave','drop'].forEach(ev => zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.remove('dragover'); }));
+    zone.addEventListener('drop', e => handler(e.dataTransfer.files));
+    input.addEventListener('change', e => handler(e.target.files));
+}
+
+wireZone('area_zone', 'area_input', uploadArea);
+
+function updateRunBtn() {
+    document.getElementById('run_btn').disabled = !(areaFilePath && projectName && demAvailable);
+}
+
+// ==================== 交付库项目 ====================
+function loadProjects() {
+    fetch('/api/list_projects').then(r => r.json()).then(data => {
+        if (!data.success) return;
+        const sel = document.getElementById('project_select');
+        (data.projects || []).forEach(p => {
+            const o = document.createElement('option');
+            o.value = p.name; o.textContent = p.name;
+            sel.appendChild(o);
+        });
+    }).catch(() => {});
+}
+
+function setProjectStatus(info) {
+    // info: {project_name, dem_available, landsat_available, landsat_sensor}
+    projectName = info && info.project_name ? info.project_name : null;
+    demAvailable = !!(info && info.dem_available);
+    const box = document.getElementById('data_status');
+    if (!projectName) {
+        box.className = 'mt-2 text-xs space-y-0.5 text-slate-400';
+        box.textContent = '尚未定位项目';
+    } else {
+        const row = (ok, label) =>
+            `<div class="flex items-center gap-1"><iconify-icon icon="${ok?'lucide:check':'lucide:x'}" width="12" class="${ok?'text-emerald-500':'text-red-400'}"></iconify-icon>`
+            + `<span class="${ok?'text-slate-600':'text-red-400'}">${label}</span></div>`;
+        box.className = 'mt-2 text-xs space-y-0.5';
+        box.innerHTML =
+            `<div class="text-slate-500 mb-0.5">项目:${projectName}</div>` +
+            row(demAvailable, 'DEM.tif(地形分析必需)' + (demAvailable ? '' : ' — 缺失,无法生成')) +
+            row(!!info.landsat_available, 'Landsat 叠加(' + (info.landsat_sensor || '无') + ',可选)');
+    }
+    // 同步下拉框选中
+    if (projectName) document.getElementById('project_select').value = projectName;
+    updateRunBtn();
+}
+
+function onProjectChange() {
+    const name = document.getElementById('project_select').value;
+    if (!name) { setProjectStatus(null); return; }
+    fetch('/api/project_data?project=' + encodeURIComponent(name))
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) { setProjectStatus(data); addLog('已选交付项目: ' + data.project_name, 'info'); }
+            else { setProjectStatus(null); addLog('项目数据探测失败: ' + data.message, 'error'); }
+        })
+        .catch(err => addLog('项目数据探测错误: ' + err.message, 'error'));
+}
+
+loadProjects();
+
+// ==================== 2. 区域文件上传 ====================
+function uploadArea(files) {
+    if (!files.length) return;
+    const fd = new FormData();
+    fd.append('file', files[0]);
+
+    addLog('上传区域文件: ' + files[0].name, 'info');
+    fetch('/api/upload_area', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                areaFilePath = data.file_path;
+                const zone = document.getElementById('area_zone');
+                zone.classList.add('uploaded');
+                zone.querySelector('.zone-title').textContent = '区域已就绪';
+                zone.querySelector('.zone-hint').textContent = files[0].name;
+
+                const info = document.getElementById('area_info');
+                info.classList.remove('hidden');
+                document.getElementById('area_filename').innerHTML =
+                    '<iconify-icon icon="lucide:check-circle" style="color:#10b981"></iconify-icon> ' +
+                    data.filename + ' (' + data.file_size + ')';
+                const preview = data.polygon_coords.map((c,i) => `${i+1}: (${c[0].toFixed(4)}, ${c[1].toFixed(4)})`).join(' &nbsp; ');
+                document.getElementById('polygon_preview').innerHTML = '<b>多边形顶点 (' + data.polygon_coords.length + '):</b><br>' + preview;
+                addLog('区域文件解析成功，' + data.polygon_coords.length + ' 个顶点', 'success');
+
+                // 据 ROI 文件名自动定位交付项目与冬季数据
+                const r = data.resolved || {};
+                if (r.project_name) {
+                    setProjectStatus(r);
+                    addLog('已从交付库定位项目: ' + r.project_name
+                        + '(DEM ' + (r.dem_available?'✓':'✗') + ' / Landsat ' + (r.landsat_sensor||'无') + ')',
+                        r.dem_available ? 'success' : 'error');
+                } else {
+                    addLog('未能按文件名自动匹配交付项目,请在"卫星数据"下拉框手动选择', 'info');
+                }
+            } else {
+                addLog('区域上传失败: ' + data.message, 'error');
+            }
+            updateRunBtn();
+        })
+        .catch(err => addLog('区域上传错误: ' + err.message, 'error'));
+}
+
+// ==================== Generation ====================
+function startGeneration() {
+    if (!areaFilePath || !projectName || !demAvailable) return;
+    const params = {
+        project_name: projectName,
+        file_path: areaFilePath,
+        azimuth: parseFloat(document.getElementById('azimuth').value) || 315,
+        altitude: parseFloat(document.getElementById('altitude').value) || 30,
+        use_landsat: document.getElementById('use_landsat').checked
+    };
+
+    document.getElementById('run_btn').disabled = true;
+    document.getElementById('progress_section').classList.remove('hidden');
+    document.getElementById('results_section').classList.add('hidden');
+    setStatus('running', '生成中...');
+
+    fetch('/api/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params)
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            taskId = data.task_id;
+            addLog('任务已启动: ' + taskId, 'success');
+            startPolling();
+        } else {
+            addLog('启动失败: ' + data.message, 'error');
+            document.getElementById('run_btn').disabled = false;
+            setStatus('idle', '就绪');
+        }
+    })
+    .catch(err => {
+        addLog('请求错误: ' + err.message, 'error');
+        document.getElementById('run_btn').disabled = false;
+        setStatus('idle', '就绪');
+    });
+}
+
+function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+        fetch('/api/status/' + taskId)
+            .then(r => r.json())
+            .then(data => {
+                if (!data.success) return;
+                const t = data.task;
+                setProgress(t.progress);
+                if (t.logs) t.logs.forEach(l => addLog(l, 'info'));
+                if (t.status === 'completed') {
+                    clearInterval(pollTimer);
+                    setStatus('done', '已完成');
+                    setProgress(100);
+                    showResults(t.results);
+                    document.getElementById('run_btn').disabled = false;
+                    addLog('全部完成!', 'success');
+                } else if (t.status === 'failed') {
+                    clearInterval(pollTimer);
+                    setStatus('error', '失败');
+                    addLog('任务失败: ' + (t.error || ''), 'error');
+                    document.getElementById('run_btn').disabled = false;
+                }
+            })
+            .catch(() => {});
+    }, 1500);
+}
+
+function showResults(results) {
+    if (!results || !results.output_files) return;
+    document.getElementById('results_section').classList.remove('hidden');
+    const base = '/api/result/' + taskId + '/';
+    document.getElementById('img_a').src = base + results.output_files.hillshade;
+    document.getElementById('img_b').src = base + results.output_files.aspect;
+    document.getElementById('img_c').src = base + results.output_files.terrain;
+    ['img_a','img_b','img_c'].forEach(id => {
+        const img = document.getElementById(id);
+        img.onclick = () => {
+            img.classList.toggle('zoomed');
+            img.style.transform = img.classList.contains('zoomed') ? 'scale(1.8)' : 'scale(1)';
+        };
+    });
+    renderDerivatives(results, base);
+}
+
+function renderDerivatives(results, base) {
+    const products = results.products || {};
+    const stats = results.structural_stats || {};
+
+    // 构造统计
+    const fmt = (v) => (v === null || v === undefined) ? '—' : v;
+    const strikes = (stats.dominant_strikes_deg || []).map(d => Math.round(d) + '°').join('、') || '—';
+    const er = stats.elevation_range_m || [];
+    document.getElementById('struct_stats').innerHTML = [
+        ['AOI', fmt(results.aoi_name)],
+        ['自动提取线性体(断裂)', fmt(stats.n_lineaments) + ' 条'],
+        ['线性体总长度', stats.total_lineament_length_km != null ? stats.total_lineament_length_km.toFixed(1) + ' km' : '—'],
+        ['主构造方向(走向)', strikes],
+        ['平均断裂密度', stats.lineament_density_mean != null ? stats.lineament_density_mean.toFixed(4) : '—'],
+        ['高程范围', er.length === 2 ? Math.round(er[0]) + '–' + Math.round(er[1]) + ' m' : '—'],
+    ].map(([k,v]) => `<div class="flex justify-between border-b border-slate-100 py-1"><span class="text-slate-500">${k}</span><span class="font-medium">${v}</span></div>`).join('');
+
+    // 玫瑰图
+    const roseImg = document.getElementById('img_rose');
+    const roseDl = document.getElementById('rose_dl');
+    const roseEmpty = document.getElementById('rose_empty');
+    if (products.rose_diagram) {
+        roseImg.src = base + products.rose_diagram; roseImg.classList.remove('hidden');
+        roseDl.href = base + products.rose_diagram; roseDl.classList.remove('hidden');
+        roseEmpty.classList.add('hidden');
+    } else {
+        roseImg.classList.add('hidden'); roseDl.classList.add('hidden'); roseEmpty.classList.remove('hidden');
+    }
+
+    // 衍生栅格(套色预览 + 原始 GeoTIFF 下载)
+    const RASTERS = [
+        ['svf', 'svf.tif', '天空视域因子(SVF)'],
+        ['openness', 'openness.tif', '地形开度(Openness)'],
+        ['curvature', 'curvature.tif', '地形曲率(脊正谷负)'],
+        ['distance_to_lineament', 'distance_to_lineament.tif', '距断裂距离'],
+        ['lineament_density', 'lineament_density.tif', '断裂密度'],
+        ['slope', 'slope.tif', '坡度'],
+    ];
+    const pbase = '/api/preview/' + taskId + '/';
+    const grid = document.getElementById('deriv_grid');
+    const cells = RASTERS.filter(r => products[r[0]]).map(([key, fname, label]) => `
+        <div class="border border-slate-200 rounded-lg overflow-hidden">
+            <div class="bg-slate-50 px-3 py-1.5 flex items-center justify-between">
+                <span class="text-xs font-medium text-slate-700">${label}</span>
+                <a href="${base + fname}" download class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1">
+                    <iconify-icon icon="lucide:download" width="12"></iconify-icon> tif
+                </a>
+            </div>
+            <img src="${pbase + fname}" alt="${label}" class="w-full" style="background:#fff" loading="lazy">
+        </div>`).join('');
+    grid.innerHTML = cells || '<div class="text-sm text-slate-400">无衍生栅格(可能未提取到线性体或缺 DEM)。</div>';
+
+    // 矢量下载
+    const vdl = document.getElementById('vector_dl');
+    if (products.lineaments_geojson) {
+        vdl.innerHTML = `<a href="${base + products.lineaments_geojson}" download class="text-blue-600 hover:text-blue-800 inline-flex items-center gap-1">
+            <iconify-icon icon="lucide:download" width="14"></iconify-icon> 下载线性体矢量(lineaments.geojson)</a>`;
+    } else {
+        vdl.innerHTML = '';
+    }
+}
+
+// ==================== UI Helpers ====================
+function switchTab(btn) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+    document.getElementById(btn.dataset.tab).classList.remove('hidden');
+}
+function setProgress(pct) {
+    document.getElementById('progress_bar').style.width = pct + '%';
+    document.getElementById('progress_pct').textContent = pct + '%';
+}
+function setStatus(state, text) {
+    const dot = document.getElementById('status_dot');
+    dot.className = 'inline-block w-2 h-2 rounded-full';
+    if (state === 'running') { dot.classList.add('bg-blue-500','pulse'); }
+    else if (state === 'done') { dot.classList.add('bg-emerald-500'); }
+    else if (state === 'error') { dot.classList.add('bg-red-500'); }
+    else { dot.classList.add('bg-slate-300'); }
+    document.getElementById('status_text').textContent = text;
+}
+function addLog(msg, level) {
+    const box = document.getElementById('log_box');
+    const el = document.createElement('div');
+    const now = new Date().toLocaleTimeString();
+    el.className = 'log-entry ' + (level || 'info');
+    el.textContent = '[' + now + '] ' + msg;
+    box.appendChild(el);
+    box.scrollTop = box.scrollHeight;
+}
+function downloadImg(imgId) {
+    const img = document.getElementById(imgId);
+    if (!img || !img.src) return;
+    const a = document.createElement('a');
+    a.href = img.src;
+    a.download = imgId.replace('img_','') + '.png';
+    a.click();
+}
+function clearAll() {
+    areaFilePath = null; projectName = null; demAvailable = false; taskId = null;
+    if (pollTimer) clearInterval(pollTimer);
+    const az = document.getElementById('area_zone');
+    az.classList.remove('uploaded','uploading');
+    az.querySelector('.zone-title').textContent = '上传 ROI / KML 文件';
+    az.querySelector('.zone-hint').textContent = '据此到交付库自动定位卫星数据';
+    document.getElementById('area_info').classList.add('hidden');
+    document.getElementById('project_select').value = '';
+    setProjectStatus(null);
+    document.getElementById('progress_section').classList.add('hidden');
+    document.getElementById('results_section').classList.add('hidden');
+    document.getElementById('run_btn').disabled = true;
+    document.getElementById('log_box').innerHTML = '<div class="log-entry info">已重置，请重新上传 ROI 文件</div>';
+    setStatus('idle', '就绪');
+    document.getElementById('area_input').value = '';
+}
+</script>
+</body>
+</html>

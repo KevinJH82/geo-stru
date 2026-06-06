@@ -1,0 +1,67 @@
+# ============ Python ============
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# ============ 操作系统 / 编辑器 ============
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# ============ 日志 / 运行时 ============
+*.log
+logs/
+*.pid
+
+# ============ 数据 / 下载 / 缓存 / 输出（大文件，不入库）============
+downloads/
+download/
+mintpy_work/
+cache/
+.cache/
+output/
+outputs/
+results/
+uploads/
+temp/
+tmp/
+data_dir/
+data_dir/
+*.sqlite
+*.db
+
+# ============ 大文件类型（卫星/模型/科学数据）============
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.7z
+*.rar
+*.h5
+*.hdf5
+*.he5
+*.tif
+*.tiff
+*.img
+*.dem
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.safetensors
+*.gfc
+*.nc
+*.grd
+*.SAFE/
