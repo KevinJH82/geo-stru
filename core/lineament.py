@@ -61,6 +61,7 @@ def extract_lineaments(
     slope_gate_cap: float = 8.0,
     min_length_m: float = 300.0,
     density_window_m: float = 1000.0,
+    rng_seed: Optional[int] = None,
 ) -> Dict:
     """
     从多方位山体阴影提取线性体。
@@ -76,6 +77,7 @@ def extract_lineaments(
         slope_gate_pct: 坡度门控自适应分位(对地形起伏自适应:陡区只留强边缘,缓区放宽)
         min_length_m: 线段最小长度(米),短于此的剔除(抑制噪声)
         density_window_m: 断裂密度滑窗边长(米)
+        rng_seed: 概率霍夫提线的随机种子;None=每次随机(历史行为),给定整数则结果可复现
 
     Returns:
         dict: {
@@ -131,8 +133,10 @@ def extract_lineaments(
     # 小 AOI(像素少)用更低的投票阈值,否则短而真实的线性体会被漏检。
     min_len_px = max(3, int(min_length_m / max(pixel_size_m[0], pixel_size_m[1])))
     hough_thr = int(np.clip(min(H, W) // 4, 5, 10))
+    # rng=None 时 skimage 用全新熵源(np.random.seed 也无法固定),故须显式传 Generator
+    _rng = np.random.default_rng(rng_seed) if rng_seed is not None else None
     lines = probabilistic_hough_line(
-        skel, threshold=hough_thr, line_length=min_len_px, line_gap=3,
+        skel, threshold=hough_thr, line_length=min_len_px, line_gap=3, rng=_rng,
     )
 
     segments = []
