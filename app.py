@@ -414,3 +414,78 @@ def preview_raster(task_id, filename):
     except Exception as e:
         logger.error(f"预览渲染失败 {filename}: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# InSAR × 构造解译 融合端点
+# ---------------------------------------------------------------------------
+@app.route('/api/insar_fusion', methods=['POST'])
+def api_insar_fusion():
+    """
+    触发 InSAR 形变 × 构造解译融合。
+
+    接收 geo-insar AOI 目录路径 + 可选的 geo-stru structural 目录路径,
+    在后台线程中调用 core.insar_fusion.run_fusion(), 产物落盘到
+    results/<AOI>/insar_fusion/<run_id>/。
+
+    自动检测数据格式(MintPy h5 / geo-insar TIF+npy), 如有 2D 分解结果
+    则用垂直速率做活动性打标 + 沉降探测, 并提取东西向形变线性体。
+    """
+    params = request.json or {}
+    insar_dir = params.get('insar_dir')
+    structural_dir = params.get('structural_dir')
+    aoi_name = params.get('aoi_name')
+    seed = params.get('seed', 42)
+
+    if not insar_dir or not os.path.isdir(insar_dir):
+        return jsonify({'success': False,
+                        'message': 'insar_dir 不存在,请提供 geo-insar AOI 目录路径'}), 400
+
+    if structural_dir and not os.path.isdir(structural_dir):
+        return jsonify({'success': False,
+                        'message': 'structural_dir 不存在'}), 400
+
+    # 输出目录
+    safe_name = re.sub(r'[\\/:*?"<>|]+', '_', aoi_name or Path(insar_dir).name).strip()
+    run_id = datetime.now().strftime('%Y%m%d_%H%M%S') + '_insar'
+    output_dir = os.path.join(Config.RESULTS_FOLDER, safe_name, 'insar_fusion', run_id)
+
+    task_id = f"insar_{task_counter:04d}"
+    task_counter += 1
+    analysis_tasks[task_id] = {
+        'id': task_id, 'aoi_name': aoi_name or safe_name,
+        'status': 'running', 'progress': 0,
+        'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'logs': [], 'results': None,
+    }
+
+    def run_fusion_task():
+        try:
+            from core.insar_fusion import run_fusion
+            md = run_fusion(
+                insar_dir=insar_dir, out_dir=output_dir,
+                aoi_name=aoi_name, seed=seed,
+                structural_dir=structural_dir, make_plots=True,
+            )
+            analysis_tasks[task_id]['status'] = 'completed'
+            analysis_tasks[task_id]['progress'] = 100
+            analysis_tasks[task_id]['results'] = {
+                'result_dir': output_dir,
+                'metadata': md,
+                'output_files': md.get('products', {}),
+            }
+            analysis_tasks[task_id]['end_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        except Exception as e:
+            import traceback
+            err = traceback.format_exc()
+            logger.error(f"InSAR 融合失败: {err}")
+            analysis_tasks[task_id]['status'] = 'failed'
+            analysis_tasks[task_id]['error'] = str(e)
+
+    t = threading.Thread(target=run_fusion_task, daemon=True)
+    t.start()
+
+    return jsonify({
+        'success': True, 'task_id': task_id,
+        'output_dir': output_dir,
+    })
