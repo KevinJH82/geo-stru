@@ -1,0 +1,175 @@
+# deposit_rules.yaml — 矿床类型构造推理规则配置
+#
+# geo-stru 矿床推理引擎的知识库。修改此文件后无需改代码即可生效。
+# 结构说明:
+#   typical_strikes: [最小, 最大] 走向范围 (度), null=不敏感
+#   strike_tolerance: 走向匹配容差 (度)
+#   min_density: 断裂密度下限
+#   conjugate_bonus: 是否检查共轭走向
+#   conjugate_pair: [最小, 最大] 共轭方向范围
+#   elevation_range: [最低, 最高] 典型高程 (米)
+#   curvature_valley_ratio: [最小, 最大] 脊谷比范围, null=不检查
+#   slope_mean_max: 平均坡度上限 (度), null=不检查
+#   subsidence_hint: 形变佐证类型 ("goaf"=采空沉降)
+#   strike_concentration_bonus: 走向高度集中加分 (脉型)
+#   strike_dispersion_bonus: 走向分散加分 (环形构造)
+#   description: 中文描述
+#   control_model: 构造控矿模式
+#   commodities: 关联矿种列表
+
+deposit_rules:
+  蚀变岩型金矿(破碎带):
+    typical_strikes: [25, 45]
+    strike_tolerance: 30
+    min_density: 0.005
+    conjugate_bonus: true
+    conjugate_pair: [80, 120]
+    elevation_range: [100, 1500]
+    curvature_valley_ratio: null
+    slope_mean_max: null
+    subsidence_hint: goaf
+    description: 构造破碎带控矿,NE/NNE走向断裂为主
+    control_model: 破碎带蚀变岩型
+    commodities: [gold, copper_gold]
+
+  斑岩型铜钼矿:
+    typical_strikes: null
+    strike_tolerance: 90
+    min_density: 0.003
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [200, 4000]
+    curvature_valley_ratio: null
+    slope_mean_max: null
+    strike_dispersion_bonus: true
+    description: 多方向断裂+环形构造,中高海拔岩体侵入环境
+    control_model: 岩体侵位构造
+    commodities: [copper, molybdenum, copper_gold]
+
+  矽卡岩型铁矿/铜矿:
+    typical_strikes: [45, 90]
+    strike_tolerance: 45
+    min_density: 0.002
+    conjugate_bonus: true
+    conjugate_pair: [30, 60]
+    elevation_range: [100, 2500]
+    curvature_valley_ratio: [0.3, 0.7]
+    slope_mean_max: null
+    description: 接触带构造,NE-EW走向,脊谷交替
+    control_model: 接触带控矿
+    commodities: [iron, copper, tungsten]
+
+  VMS型多金属矿:
+    typical_strikes: null
+    strike_tolerance: 90
+    min_density: 0.001
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [50, 2000]
+    curvature_valley_ratio: [0.4, 0.6]
+    slope_mean_max: null
+    description: 火山-沉积建造,断裂发育程度中等
+    control_model: 火山-沉积建造
+    commodities: [polymetallic, copper, gold, zinc, lead]
+
+  石英脉型金矿:
+    typical_strikes: [0, 30]
+    strike_tolerance: 25
+    min_density: 0.004
+    conjugate_bonus: true
+    conjugate_pair: [60, 100]
+    elevation_range: [50, 1500]
+    curvature_valley_ratio: null
+    slope_mean_max: null
+    strike_concentration_bonus: true
+    description: 石英脉沿断裂充填,走向集中
+    control_model: 断裂充填脉型
+    commodities: [gold]
+
+  沉积型矿产(煤/铝土/盐类):
+    typical_strikes: null
+    strike_tolerance: 90
+    min_density: 0.0
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [0, 800]
+    curvature_valley_ratio: null
+    slope_mean_max: 10.0
+    subsidence_hint: goaf
+    description: 沉积盆地/缓坡区,断裂不发育
+    control_model: 沉积盆地
+    commodities: [coal, bauxite, salt]
+
+  常规油气藏(微渗漏):
+    typical_strikes: null
+    strike_tolerance: 90
+    min_density: 0.0
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [0, 2000]
+    curvature_valley_ratio: null
+    slope_mean_max: 20.0
+    description: 沉积盆地油气藏,断裂不发育;覆盖平原盆地与黄土高原含油气区(鄂尔多斯/松辽/渤海湾等)
+    control_model: 构造-地层圈闭
+    commodities: [petroleum, gas, oil]
+
+  致密油气/页岩气:
+    typical_strikes: [30, 60]
+    strike_tolerance: 45
+    min_density: 0.002
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [100, 2500]
+    curvature_valley_ratio: null
+    slope_mean_max: 25.0
+    description: 致密储层受区域构造/裂缝控制;覆盖鄂尔多斯致密油气/四川页岩气等
+    control_model: 裂缝型致密储层
+    commodities: [petroleum, gas, coalbed_gas, shale_gas]
+
+  煤层气/煤炭:
+    typical_strikes: null
+    strike_tolerance: 90
+    min_density: 0.0
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [0, 1800]
+    curvature_valley_ratio: null
+    slope_mean_max: 15.0
+    subsidence_hint: goaf
+    description: 含煤盆地/黄土高原矿区,缓坡-中坡,采空佐证
+    control_model: 沉积盆地
+    commodities: [coal, coalbed_gas]
+
+  BIF型铁矿:
+    typical_strikes: null
+    strike_tolerance: 90
+    min_density: 0.001
+    conjugate_bonus: false
+    conjugate_pair: null
+    elevation_range: [100, 2000]
+    curvature_valley_ratio: null
+    slope_mean_max: null
+    description: 条带状铁建造,受地层走向控制
+    control_model: 沉积-变质型
+    commodities: [iron]
+
+
+# 矿种→矿床类型映射 (用于 mineral_hint 加分)
+commodity_map:
+  gold: [蚀变岩型金矿(破碎带), 石英脉型金矿]
+  copper: [斑岩型铜钼矿, 矽卡岩型铁矿/铜矿]
+  molybdenum: [斑岩型铜钼矿]
+  iron: [矽卡岩型铁矿/铜矿, BIF型铁矿]
+  petroleum: [常规油气藏(微渗漏), 致密油气/页岩气]
+  oil: [常规油气藏(微渗漏)]
+  gas: [常规油气藏(微渗漏), 致密油气/页岩气]
+  coalbed_gas: [致密油气/页岩气, 煤层气/煤炭]
+  coal: [煤层气/煤炭]
+  polymetallic: [VMS型多金属矿, 矽卡岩型铁矿/铜矿]
+  copper_gold: [斑岩型铜钼矿, 蚀变岩型金矿(破碎带)]
+  shale_gas: [致密油气/页岩气]
+  tungsten: [矽卡岩型铁矿/铜矿]
+  zinc: [VMS型多金属矿]
+  lead: [VMS型多金属矿]
+  bauxite: [沉积型矿产(煤/铝土/盐类)]
+  salt: [沉积型矿产(煤/铝土/盐类)]

@@ -49,6 +49,80 @@ def _pixel_to_lonlat(col: float, row: float, transform) -> Tuple[float, float]:
     return float(lon), float(lat)
 
 
+def _score_segment(p0, p1, img, skel, slope, curvature, valid_mask, pixel_size_m):
+    """
+    为单条线段计算置信度 (0–1)。
+
+    综合四个维度:
+      1. 边缘强度:沿线段采样拉伸后图像的梯度幅值均值(高=边缘清晰)
+      2. 骨架连续性:线段像元落在骨架上的比例(高=连贯的线性特征)
+      3. 坡度信号:沿线段坡度均值(适度坡度更可能是构造而非平坦区噪声)
+      4. 曲率一致性(可选):线段穿越区域曲率方向一致(正值/脊 或 负值/谷)时加分
+
+    Returns:
+        float: 置信度 [0, 1]
+    """
+    H, W = img.shape
+    length_px = max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1]))
+    n_samp = max(3, int(length_px))
+    ts = np.linspace(0, 1, n_samp)
+
+    edge_vals, skel_vals, slope_vals, curv_vals = [], [], [], []
+    for t in ts:
+        cc = int(round(p0[0] + t * (p1[0] - p0[0])))
+        rr = int(round(p0[1] + t * (p1[1] - p0[1])))
+        if 0 <= rr < H and 0 <= cc < W:
+            # 边缘强度:取邻域梯度(3x3)的最大值
+            r_lo, r_hi = max(0, rr - 1), min(H, rr + 2)
+            c_lo, c_hi = max(0, cc - 1), min(W, cc + 2)
+            patch = img[r_lo:r_hi, c_lo:c_hi]
+            if patch.size >= 4:
+                gy, gx = np.gradient(patch)
+                edge_vals.append(float(np.hypot(gx, gy).max()))
+            skel_vals.append(float(skel[rr, cc]))
+            slope_vals.append(float(slope[rr, cc]))
+            if curvature is not None:
+                curv_vals.append(float(curvature[rr, cc]))
+
+    if not edge_vals:
+        return 0.5  # 无采样点,给默认值
+
+    # 1. 边缘强度 (0–1):归一化到 [0,1],越高越好
+    mean_edge = float(np.mean(edge_vals))
+    edge_score = min(1.0, mean_edge / 0.5)  # 0.5 为典型强边缘梯度
+
+    # 2. 骨架连续性 (0–1):线段经过的骨架像元比例
+    skel_ratio = float(np.mean(skel_vals)) if skel_vals else 0.0
+    skel_score = skel_ratio
+
+    # 3. 坡度信号 (0–1):适度坡度(5–30°)加分,太平坦(<2°)扣分
+    mean_slope = float(np.mean(slope_vals)) if slope_vals else 0.0
+    if mean_slope < 2.0:
+        slope_score = 0.3
+    elif mean_slope < 30.0:
+        slope_score = min(1.0, mean_slope / 15.0)
+    else:
+        slope_score = 0.7  # 极陡可能是滑坡而非构造
+
+    # 4. 曲率一致性(可选):同号曲率占多数 → 一致性高
+    curv_score = 0.5  # 默认
+    if curv_vals:
+        signs = [1 if v > 0 else (-1 if v < 0 else 0) for v in curv_vals]
+        nonzero = [s for s in signs if s != 0]
+        if len(nonzero) >= 3:
+            same_sign_ratio = max(nonzero.count(1), nonzero.count(-1)) / len(nonzero)
+            curv_score = 0.3 + 0.7 * same_sign_ratio
+        elif nonzero:
+            curv_score = 0.4
+
+    # 加权综合 (边缘+骨架为主,坡度+曲率为辅)
+    confidence = (0.30 * edge_score +
+                  0.30 * skel_score +
+                  0.20 * slope_score +
+                  0.20 * curv_score)
+    return float(np.clip(confidence, 0.0, 1.0))
+
+
 def extract_lineaments(
     multidir_hillshade: np.ndarray,
     slope: np.ndarray,
@@ -139,6 +213,24 @@ def extract_lineaments(
         skel, threshold=hough_thr, line_length=min_len_px, line_gap=3, rng=_rng,
     )
 
+    # 曲率(用于水系假阳性判别:河谷=负曲率/凹形)
+    curvature = None
+    if valid_mask is not None:
+        try:
+            from core.terrain_utils import TerrainProcessor
+            # 从 slope 估算曲率方向(简化:用坡度的拉普拉斯近似)
+            # 负值=凹(河谷),正值=凸(山脊)
+            slope_filled = np.nan_to_num(slope, nan=0.0)
+            laplacian = np.zeros_like(slope_filled)
+            laplacian[1:-1, 1:-1] = (
+                slope_filled[:-2, 1:-1] + slope_filled[2:, 1:-1] +
+                slope_filled[1:-1, :-2] + slope_filled[1:-1, 2:] -
+                4 * slope_filled[1:-1, 1:-1]
+            )
+            curvature = laplacian
+        except Exception:
+            pass
+
     segments = []
     mask = np.zeros((H, W), bool)
     for (p0, p1) in lines:
@@ -148,8 +240,34 @@ def extract_lineaments(
         strike = _segment_strike_deg(p0, p1, pixel_size_m)
         lon0, lat0 = _pixel_to_lonlat(p0[0], p0[1], transform)
         lon1, lat1 = _pixel_to_lonlat(p1[0], p1[1], transform)
+        # ---- 置信度评分 (0-1) ----
+        confidence = _score_segment(p0, p1, img, skel, slope, curvature,
+                                    valid_mask, pixel_size_m)
+
+        # ---- 水系假阳性过滤 ----
+        is_valley = False
+        if curvature is not None:
+            n_samp = max(3, int(length_m / max(pixel_size_m) / 5))
+            ts = np.linspace(0.1, 0.9, n_samp)
+            curv_vals, slope_vals = [], []
+            for t in ts:
+                cc = int(round(p0[0] + t * (p1[0] - p0[0])))
+                rr = int(round(p0[1] + t * (p1[1] - p0[1])))
+                if 0 <= rr < H and 0 <= cc < W:
+                    curv_vals.append(curvature[rr, cc])
+                    slope_vals.append(slope[rr, cc])
+            if curv_vals:
+                mean_curv = float(np.mean(curv_vals))
+                mean_slope = float(np.mean(slope_vals))
+                # 河谷:显著凹曲率 + 低-中坡度
+                if mean_curv < -0.3 and mean_slope < 8.0:
+                    is_valley = True
+                    confidence *= 0.4
+
         segments.append({'p0': (lon0, lat0), 'p1': (lon1, lat1),
-                         'strike_deg': strike, 'length_m': length_m})
+                         'strike_deg': strike, 'length_m': length_m,
+                         'confidence': round(float(confidence), 3),
+                         'is_valley_candidate': is_valley})
         # 在 mask 上栅格化该线段(Bresenham 近似)
         n = int(max(abs(p1[0] - p0[0]), abs(p1[1] - p0[1]))) + 1
         cols = np.linspace(p0[0], p1[0], n).astype(int).clip(0, W - 1)

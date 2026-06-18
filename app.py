@@ -11,22 +11,51 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
+from loguru import logger
+
 from config.config import Config
 from core.structural_engine import StructuralEngine
 from core import delivery
 from utils.file_utils import get_file_size
-from utils.logger import get_logger
 
 app = Flask(__name__)
 app.secret_key = Config.SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
 
-logger = get_logger(__name__, Config.LOG_FILE)
+# loguru 默认输出到 stderr; 如需文件日志,按 Config.LOG_FILE 配置 sink。
+logger.configure(handlers=[
+    {"sink": __import__('sys').stderr, "level": Config.LOG_LEVEL},
+])
+if Config.LOG_FILE:
+    os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
+    logger.add(Config.LOG_FILE, level=Config.LOG_LEVEL,
+               rotation="10 MB", retention="7 days",
+               format="{time:YYYY-MM-DD HH:mm:ss} | {level:<7} | {name}:{function}:{line} - {message}")
 
 task_counter = 0
 analysis_tasks = {}
+_tasks_lock = threading.Lock()
+
+# 任务状态清理: 完成的任务超过此阈值后,清理最早的,防止内存无限增长。
+MAX_COMPLETED_TASKS = 50
 
 STRUCTURAL_EXTENSIONS = {'kml', 'kmz', 'ovkml', 'xlsx', 'xls', 'csv'}
+
+
+def _cleanup_old_tasks():
+    """当已完成/失败的任务超过阈值时,删除最早的条目以释放内存。"""
+    global analysis_tasks
+    with _tasks_lock:
+        finished = [(tid, t) for tid, t in analysis_tasks.items()
+                    if t.get('status') in ('completed', 'failed')]
+        if len(finished) <= MAX_COMPLETED_TASKS:
+            return
+        # 按创建时间排序,删除最早的
+        finished.sort(key=lambda x: x[1].get('start_time', ''))
+        to_remove = finished[:len(finished) - MAX_COMPLETED_TASKS]
+        for tid, _ in to_remove:
+            del analysis_tasks[tid]
+        logger.info(f"已清理 {len(to_remove)} 个历史任务, 当前保留 {len(analysis_tasks)} 个")
 
 
 @app.route('/')
@@ -286,6 +315,7 @@ def start_generation():
                     use_landsat=params.get('use_landsat', True),
                     log_callback=on_log,
                     aoi_name=aoi_name,
+                    mineral_hint=params.get('mineral_hint'),
                 )
 
                 analysis_tasks[task_id]['status'] = 'completed'
@@ -302,6 +332,8 @@ def start_generation():
                 analysis_tasks[task_id]['progress'] = 0
                 ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 analysis_tasks[task_id]['logs'].append(f"[{ts}] [ERROR] {str(e)}")
+            finally:
+                _cleanup_old_tasks()
 
         t = threading.Thread(target=run_task, daemon=True)
         t.start()
@@ -333,9 +365,106 @@ def task_status(task_id):
     return jsonify({'success': True, 'task': safe})
 
 
+# ---------------------------------------------------------------------------
+# 历史分析记录
+# ---------------------------------------------------------------------------
+@app.route('/api/history')
+def api_history():
+    """扫描 results/ 目录,返回所有已完成的构造解译/InSAR 融合分析记录。"""
+    results_root = Path(Config.RESULTS_FOLDER)
+    if not results_root.exists():
+        return jsonify({'success': True, 'records': []})
+
+    records = []
+    for aoi_dir in sorted(results_root.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+        if not aoi_dir.is_dir() or aoi_dir.name.startswith('_'):
+            continue
+        # 查找所有 run (structural 和 insar_fusion)
+        for category in ('structural', 'insar_fusion'):
+            cat_dir = aoi_dir / category
+            if not cat_dir.is_dir():
+                continue
+            # 版本化布局: run 子目录
+            for run_dir in sorted(cat_dir.iterdir(), key=lambda d: d.name, reverse=True):
+                md_path = run_dir / 'metadata.json'
+                if not md_path.exists():
+                    continue
+                try:
+                    with open(md_path, 'r', encoding='utf-8') as f:
+                        md = json.load(f)
+                    records.append({
+                        'aoi_name': md.get('aoi_name') or aoi_dir.name,
+                        'source': md.get('source', ''),
+                        'run_id': md.get('run_id') or run_dir.name,
+                        'category': category,
+                        'created_at': md.get('created_at', ''),
+                        'aoi_bbox': md.get('aoi_bbox'),
+                        'result_dir': str(run_dir),
+                        'metadata_path': str(md_path),
+                        'products': md.get('products', {}),
+                        'structural_stats': md.get('structural_stats') or md.get('fusion_stats', {}).get('topographic_dominant_strikes_deg'),
+                        'deposit_inference': md.get('deposit_inference'),
+                        'n_products': len(md.get('products', {})),
+                    })
+                except Exception:
+                    continue
+    return jsonify({'success': True, 'records': records[:50]})  # 最多返回50条
+
+
+@app.route('/api/history_result')
+def api_history_result():
+    """从磁盘加载历史分析结果(供前端历史面板回顾)。"""
+    metadata_path = request.args.get('metadata_path', '')
+    result_dir = request.args.get('result_dir', '')
+
+    if not metadata_path or not os.path.exists(metadata_path):
+        return jsonify({'success': False, 'message': 'metadata 不存在'}), 404
+    # 路径安全检查
+    if '..' in metadata_path or not os.path.abspath(metadata_path).startswith(
+            os.path.abspath(Config.RESULTS_FOLDER)):
+        return jsonify({'success': False, 'message': '非法路径'}), 400
+
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            md = json.load(f)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'读取 metadata 失败: {e}'}), 500
+
+    products = md.get('products', {})
+    # 构造与 showResults 兼容的结果对象
+    results = {
+        'result_dir': result_dir,
+        'output_files': {
+            'hillshade': products.get('map_hillshade_png', ''),
+            'aspect': products.get('map_aspect_png', ''),
+            'terrain': products.get('map_terrain_png', ''),
+        },
+        'products': products,
+        'structural_stats': md.get('structural_stats', {}),
+        'deposit_inference': md.get('deposit_inference'),
+        'aoi_name': md.get('aoi_name', ''),
+        'aoi_bbox': md.get('aoi_bbox', []),
+        'elevation_range': md.get('structural_stats', {}).get('elevation_range_m', []),
+    }
+    # 注册到内存以便图片加载
+    global task_counter
+    hist_id = f"hist_{task_counter:04d}"
+    task_counter += 1
+    analysis_tasks[hist_id] = {
+        'id': hist_id, 'status': 'completed', 'progress': 100,
+        'results': results, 'logs': [],
+    }
+    results['task_id'] = hist_id
+    return jsonify({'success': True, 'results': results})
+
+
 @app.route('/api/result/<task_id>/<filename>')
 def result_file(task_id, filename):
     """获取生成的图片文件"""
+    # 路径穿越防护:禁止斜杠和 ..
+    if '/' in filename or '\\' in filename or '..' in filename:
+        return jsonify({'success': False, 'message': '非法文件名'}), 400
+
     if task_id not in analysis_tasks:
         return jsonify({'success': False, 'message': '任务不存在'}), 404
 
@@ -348,6 +477,9 @@ def result_file(task_id, filename):
         return jsonify({'success': False, 'message': '结果目录不存在'}), 404
 
     file_path = os.path.join(result_dir, filename)
+    # 二次确认:解析后路径仍在 result_dir 内
+    if not os.path.abspath(file_path).startswith(os.path.abspath(result_dir)):
+        return jsonify({'success': False, 'message': '非法路径'}), 400
     if not os.path.exists(file_path):
         return jsonify({'success': False, 'message': '文件不存在'}), 404
 
@@ -373,10 +505,15 @@ def preview_raster(task_id, filename):
     if task['status'] != 'completed' or not task.get('results'):
         return jsonify({'success': False, 'message': '任务未完成'}), 400
     result_dir = task['results'].get('result_dir')
-    if not filename.lower().endswith('.tif') or '/' in filename or '..' in filename:
+    if not filename.lower().endswith('.tif') or '/' in filename or '\\' in filename or '..' in filename:
         return jsonify({'success': False, 'message': '仅支持结果目录内的 .tif 预览'}), 400
     file_path = os.path.join(result_dir or '', filename)
-    if not result_dir or not os.path.exists(file_path):
+    if not result_dir:
+        return jsonify({'success': False, 'message': '结果目录不存在'}), 404
+    # 二次确认:解析后路径仍在 result_dir 内
+    if not os.path.abspath(file_path).startswith(os.path.abspath(result_dir)):
+        return jsonify({'success': False, 'message': '非法路径'}), 400
+    if not os.path.exists(file_path):
         return jsonify({'success': False, 'message': '文件不存在'}), 404
 
     try:
@@ -481,6 +618,8 @@ def api_insar_fusion():
             logger.error(f"InSAR 融合失败: {err}")
             analysis_tasks[task_id]['status'] = 'failed'
             analysis_tasks[task_id]['error'] = str(e)
+        finally:
+            _cleanup_old_tasks()
 
     t = threading.Thread(target=run_fusion_task, daemon=True)
     t.start()
@@ -489,3 +628,86 @@ def api_insar_fusion():
         'success': True, 'task_id': task_id,
         'output_dir': output_dir,
     })
+
+
+# ---------------------------------------------------------------------------
+# 矿床类型构造推理端点
+# ---------------------------------------------------------------------------
+@app.route('/api/deposit_inference', methods=['POST'])
+def api_deposit_inference():
+    """
+    基于 geo-stru 已有分析结果的构造特征,推理 ROI 可能的矿床类型。
+
+    接受 task_id (构造分析任务) 或 metadata_path (metadata.json 路径),
+    读取 structural_stats / 地形统计, 调用推理引擎返回候选矿床类型。
+
+    纯构造特征推理,不依赖蚀变/地球化学/已知矿点等外部数据。
+    """
+    params = request.json or {}
+    task_id = params.get('task_id')
+    metadata_path = params.get('metadata_path')
+
+    # 从 task_id 定位 metadata
+    md = None
+    if task_id and task_id in analysis_tasks:
+        task = analysis_tasks[task_id]
+        if task.get('status') != 'completed':
+            return jsonify({'success': False,
+                            'message': f'任务 {task_id} 状态为 {task.get("status")}, 尚未完成'}), 400
+        result_dir = task.get('results', {}).get('result_dir')
+        if result_dir:
+            mp = os.path.join(result_dir, 'metadata.json')
+            if os.path.exists(mp):
+                metadata_path = mp
+    elif metadata_path and not os.path.exists(metadata_path):
+        return jsonify({'success': False, 'message': f'metadata_path 不存在: {metadata_path}'}), 400
+
+    if not metadata_path or not os.path.exists(metadata_path):
+        return jsonify({'success': False,
+                        'message': '请提供 task_id 或 metadata_path'}), 400
+
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            md = json.load(f)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'读取 metadata 失败: {e}'}), 500
+
+    # 如果 metadata 已有 deposit_inference,直接返回
+    existing = md.get('deposit_inference')
+    if existing and existing.get('primary_model'):
+        return jsonify({'success': True, 'deposit_inference': existing,
+                        'source': 'cached'})
+
+    # 否则重新推理
+    structural_stats = md.get('structural_stats') or md.get('fusion_stats', {})
+    if not structural_stats:
+        return jsonify({'success': False,
+                        'message': 'metadata 中无 structural_stats,请先运行构造分析'}), 400
+
+    try:
+        from core.deposit_inference import infer_deposit_type
+
+        # 提取归因统计(如果有)
+        attribution_stats = {}
+        attr_details = md.get('fusion_stats', {}).get('attribution_details', [])
+        if not attr_details:
+            # 尝试从 subsidence_details 提取
+            sub_details = md.get('fusion_stats', {}).get('subsidence_details', [])
+            for sd in sub_details:
+                ts = sd.get('ts_class', 'no_data')
+                if ts in ('linear', 'accelerating'):
+                    attribution_stats['goaf'] = attribution_stats.get('goaf', 0) + 1
+        else:
+            for ad in attr_details:
+                cls = ad.get('attribution_class', 'undetermined')
+                attribution_stats[cls] = attribution_stats.get(cls, 0) + 1
+
+        result = infer_deposit_type(
+            structural_stats=structural_stats,
+            attribution_stats=attribution_stats,
+            mineral_hint=params.get('mineral_hint'),
+        )
+        return jsonify({'success': True, 'deposit_inference': result, 'source': 'computed'})
+    except Exception as e:
+        import traceback
+        return jsonify({'success': False, 'message': f'推理失败: {traceback.format_exc()}'}), 500

@@ -28,11 +28,12 @@ from rasterio.warp import reproject, transform_bounds, Resampling
 from scipy import ndimage
 from loguru import logger
 
+from config import __version__
 from core.terrain_utils import TerrainProcessor
 from core import lineament
 
 SOURCE = "geo-stru-insar-fusion"
-VERSION = "0.2.0"
+VERSION = __version__
 DEFAULT_SEED = 42
 DEFAULT_COH_THR = 0.7
 
@@ -328,13 +329,375 @@ def detect_subsidence(velm, valid, transform, pixel_m, k_sigma=1.5,
         ys_, xs_ = np.where(m)
         cx, cy = transform * (xs_.mean() + 0.5, ys_.mean() + 0.5)
         clusters.append({
-            "id": len(clusters), "area_px": area_px,
+            "id": len(clusters), "label": kk, "area_px": area_px,
             "area_m2": round(area_px * pixel_m[0] * pixel_m[1], 1),
             "min_vel_mm_yr": round(float(np.nanmin(velm[m])), 2),
             "mean_vel_mm_yr": round(float(np.nanmean(velm[m])), 2),
             "centroid": [round(cx, 1), round(cy, 1)],
         })
     return clusters, lbl, thr
+
+
+# ---------------------------------------------------------------------------
+# 5b. B3 沉降漏斗多边形圈定 + 长轴分析
+# ---------------------------------------------------------------------------
+def delineate_goaf_polygons(clusters, lbl, velm, transform, pixel_m,
+                            topo_strikes=None):
+    """
+    将每个沉降簇转为凸包多边形,并计算长轴方向(PCA)。
+
+    Args:
+        clusters: detect_subsidence 返回的 cluster 列表(会被原地更新)
+        lbl: 连通分量标注栅格
+        velm: 速率栅格
+        transform: Affine
+        pixel_m: (x, y) 像元尺寸
+        topo_strikes: 地形线性体走向列表,用于长轴对比
+
+    Returns:
+        更新后的 clusters 列表(每条新增 boundary, long_axis_deg, strike_diff_deg)
+    """
+    H, W = lbl.shape
+    for cl in clusters:
+        cid = cl["label"]  # 原始连通分量标签
+        m = lbl == cid
+        if not m.any():
+            cl["boundary"] = None
+            cl["long_axis_deg"] = None
+            cl["strike_diff_deg"] = None
+            continue
+
+        ys, xs = np.where(m)
+        # 像元→地理坐标
+        coords = []
+        for r, c in zip(ys, xs):
+            lon, lat = transform * (c + 0.5, r + 0.5)
+            coords.append([lon, lat])
+        coords = np.array(coords)
+
+        # 凸包 (Graham scan via scipy)
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(coords)
+            hull_coords = coords[hull.vertices].tolist()
+            # 闭合
+            hull_coords.append(hull_coords[0])
+        except Exception:
+            # 退化(共线/点数<3)→用 bbox
+            x_min, y_min = coords.min(axis=0)
+            x_max, y_max = coords.max(axis=0)
+            hull_coords = [[x_min, y_min], [x_max, y_min],
+                           [x_max, y_max], [x_min, y_max], [x_min, y_min]]
+
+        cl["boundary"] = hull_coords
+
+        # PCA 长轴方向 (取第一主成分)
+        if len(coords) >= 2:
+            centered = coords - coords.mean(axis=0)
+            # 对坐标做各向异性校正 (经度方向需要 ×cos(lat) 近似)
+            mean_lat = coords[:, 1].mean()
+            cos_lat = np.cos(np.radians(mean_lat))
+            scaled = centered.copy()
+            scaled[:, 0] *= cos_lat  # 把经度差近似换算为米
+            scaled[:, 0] *= 111320   # 度→米
+            scaled[:, 1] *= 110540   # 度→米
+            cov = np.cov(scaled.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            # 最大特征值对应的特征向量
+            principal = eigvecs[:, np.argmax(eigvals)]
+            # 长轴方位角 (0=N, 顺时针, 0–180°)
+            dx, dy = principal[0], principal[1]  # 东, 北
+            axis_deg = np.degrees(np.arctan2(dx, dy)) % 180.0
+            cl["long_axis_deg"] = round(float(axis_deg), 1)
+            # 长轴 vs 最近断裂走向的最小差
+            if topo_strikes:
+                diffs = [min(abs(axis_deg - s), 180 - abs(axis_deg - s)) for s in topo_strikes]
+                cl["strike_diff_deg"] = round(float(min(diffs)), 1)
+            else:
+                cl["strike_diff_deg"] = None
+        else:
+            cl["long_axis_deg"] = None
+            cl["strike_diff_deg"] = None
+
+    return clusters
+
+
+# ---------------------------------------------------------------------------
+# 5c. B4 沉降时序分类
+# ---------------------------------------------------------------------------
+def classify_subsidence_timeseries(clusters, lbl, ts_array, dates):
+    """
+    对每个沉降簇提取均值累计形变时序,拟合线性/二次模型,分类为:
+      - "linear": 线性沉降(匀速) → 持续活动采空
+      - "accelerating": 加速沉降(二次项显著为负) → 活动加剧
+      - "decelerating": 减速沉降(二次项显著为正) → 趋于稳定
+      - "stable": 无显著趋势
+      - "no_data": 时序不可用
+
+    Args:
+        clusters: cluster 列表(会被原地更新)
+        lbl: 连通分量标注栅格
+        ts_array: (N_dates, H, W) 累计形变数组(mm), 或 None
+        dates: 日期字符串列表
+
+    Returns:
+        更新后的 clusters 列表(每条新增 ts_class, ts_r2, ts_rate_mm_yr)
+    """
+    if ts_array is None or len(dates) < 3:
+        for cl in clusters:
+            cl["ts_class"] = "no_data"
+            cl["ts_r2"] = None
+            cl["ts_rate_mm_yr"] = None
+        return clusters
+
+    n_dates = ts_array.shape[0]
+    H, W = ts_array.shape[1:]
+
+    # 时间轴 (天,相对于首日)
+    try:
+        from datetime import datetime as _dt
+        t_days = np.array([
+            (_dt.strptime(d.replace("-", ""), "%Y%m%d") -
+             _dt.strptime(dates[0].replace("-", ""), "%Y%m%d")).days
+            for d in dates
+        ], dtype=np.float64)
+    except Exception:
+        t_days = np.arange(n_dates, dtype=np.float64)
+
+    if t_days[-1] < 1:
+        t_days = np.arange(n_dates, dtype=np.float64)
+
+    for cl in clusters:
+        cid = cl["label"]  # 原始连通分量标签
+        m = lbl == cid
+        if not m.any() or m.sum() < 3:
+            cl["ts_class"] = "no_data"
+            cl["ts_r2"] = None
+            cl["ts_rate_mm_yr"] = None
+            continue
+
+        # 提取簇内均值时序
+        mean_ts = np.array([
+            float(np.nanmean(ts_array[t][m])) if np.any(np.isfinite(ts_array[t][m]))
+            else np.nan
+            for t in range(n_dates)
+        ])
+        valid_ts = np.isfinite(mean_ts)
+        if valid_ts.sum() < 3:
+            cl["ts_class"] = "no_data"
+            cl["ts_r2"] = None
+            cl["ts_rate_mm_yr"] = None
+            continue
+
+        y = mean_ts[valid_ts] - mean_ts[valid_ts][0]  # 去起始偏移
+        t = t_days[valid_ts]
+
+        # 线性拟合: y = a*t + b
+        coeffs_lin = np.polyfit(t, y, 1)
+        y_lin = np.polyval(coeffs_lin, t)
+        ss_res_lin = np.sum((y - y_lin) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2) + 1e-12
+        r2_lin = 1 - ss_res_lin / ss_tot
+
+        # 二次拟合: y = a*t^2 + b*t + c
+        coeffs_quad = np.polyfit(t, y, 2)
+        y_quad = np.polyval(coeffs_quad, t)
+        ss_res_quad = np.sum((y - y_quad) ** 2)
+        r2_quad = 1 - ss_res_quad / ss_tot
+
+        rate_mm_yr = round(float(coeffs_lin[0]) * 365.25, 2)
+
+        # 分类规则
+        quad_a = coeffs_quad[0]  # 二次项系数
+        if ss_tot < 1e-6:
+            cls = "stable"
+        elif r2_lin > 0.8:
+            # 线性拟合已经很好
+            if abs(rate_mm_yr) < 1.0:
+                cls = "stable"
+            else:
+                cls = "linear"
+                # 检查是否有加速/减速信号
+                if r2_quad - r2_lin > 0.1 and abs(quad_a) > 1e-4:
+                    cls = "accelerating" if quad_a < 0 else "decelerating"
+        elif r2_quad > 0.7:
+            cls = "accelerating" if quad_a < 0 else "decelerating"
+        else:
+            cls = "stable"  # 拟合不好→保守判
+
+        cl["ts_class"] = cls
+        cl["ts_r2"] = round(float(max(r2_lin, r2_quad)), 3)
+        cl["ts_rate_mm_yr"] = rate_mm_yr
+
+    return clusters
+
+
+# ---------------------------------------------------------------------------
+# 5d. C线 形变归因 (断裂蠕动 / 滑坡 / 采空沉降 / 未确定)
+# ---------------------------------------------------------------------------
+def attribute_deformation(clusters, lbl, velm, valid, transform, pixel_m,
+                          defm_segments=None, slope=None, aspect=None,
+                          distance_to_lineament=None):
+    """
+    对每个沉降簇做形变归因分类。
+
+    规则(按优先级):
+      1. **采空沉降** (goaf): 圆/椭圆形态 + 时序分类为 linear/accelerating + 负速率
+      2. **滑坡** (landslide): 坡度大(>15°) + 沉降方向与坡向一致
+      3. **断裂蠕动** (fault_creep): 距断裂近(<3 像元) + 漏斗长轴与断裂走向一致(<30°)
+      4. **未确定** (undetermined): 不满足以上规则
+
+    Args:
+        clusters: 含 B3/B4 属性的 cluster 列表
+        lbl: 连通分量标注栅格
+        velm: 速率栅格
+        valid: 有效掩膜
+        transform: Affine
+        pixel_m: 像元尺寸
+        defm_segments: 形变线性体段列表(走向用于交叉验证)
+        slope: 坡度栅格(度), 可选
+        aspect: 坡向栅格(度, -1=平), 可选
+        distance_to_lineament: 距断裂距离栅格(米), 可选
+
+    Returns:
+        attribution_raster: (H,W) int8 栅格 (0=无, 1=采空, 2=滑坡, 3=断裂蠕动, 9=未确定)
+        clusters: 更新后的列表(每条新增 attribution_class, attribution_confidence)
+    """
+    H, W = lbl.shape
+    attr_raster = np.zeros((H, W), dtype=np.int8)
+
+    for cl in clusters:
+        cid = cl["label"]
+        m = lbl == cid
+        if not m.any():
+            cl["attribution_class"] = "undetermined"
+            cl["attribution_confidence"] = 0.0
+            continue
+
+        scores = {
+            "goaf": 0.0,
+            "landslide": 0.0,
+            "fault_creep": 0.0,
+        }
+
+        # ---- 1. 采空沉降信号 ----
+        ts_class = cl.get("ts_class", "no_data")
+        mean_vel = cl.get("mean_vel_mm_yr", 0)
+        area_m2 = cl.get("area_m2", 0)
+
+        # 负速率 (越负越可信)
+        if mean_vel < -2.0:
+            scores["goaf"] += 0.3
+        if mean_vel < -5.0:
+            scores["goaf"] += 0.2
+
+        # 时序分类: 持续/加速沉降 → 活动采空
+        if ts_class in ("linear", "accelerating"):
+            scores["goaf"] += 0.3
+        if ts_class == "accelerating":
+            scores["goaf"] += 0.1
+
+        # 面积/形态: 面积适中(100–100000 m²) → 典型采空漏斗
+        if 100 <= area_m2 <= 100000:
+            scores["goaf"] += 0.1
+
+        # 圆形度: 面积/周长² 比值接近圆 → 支持采空
+        if cl.get("boundary"):
+            boundary = cl["boundary"]
+            n_pts = len(boundary) - 1  # 去掉闭合点
+            if n_pts >= 3:
+                perimeter = sum(
+                    np.hypot(boundary[i+1][0] - boundary[i][0],
+                             boundary[i+1][1] - boundary[i][1])
+                    for i in range(n_pts)
+                )
+                if perimeter > 0:
+                    circularity = 4 * np.pi * area_m2 / (perimeter ** 2)
+                    # 圆形度 0–1, 越接近 1 越圆
+                    if circularity > 0.5:
+                        scores["goaf"] += 0.1
+
+        # ---- 2. 滑坡信号 ----
+        if slope is not None:
+            mean_slope = float(np.nanmean(slope[m]))
+            if mean_slope > 15.0:
+                scores["landslide"] += 0.3
+            elif mean_slope > 8.0:
+                scores["landslide"] += 0.15
+
+            # 坡向一致性: 沉降区坡向集中 → 滑坡
+            if aspect is not None:
+                aspect_vals = aspect[m]
+                aspect_valid = aspect_vals[aspect_vals >= 0]
+                if len(aspect_valid) > 5:
+                    # 用圆形统计: mean resultant length
+                    rad = np.deg2rad(aspect_valid)
+                    R = np.hypot(np.mean(np.sin(rad)), np.mean(np.cos(rad)))
+                    if R > 0.5:  # 坡向集中
+                        scores["landslide"] += 0.2
+
+        # ---- 3. 断裂蠕动信号 ----
+        if distance_to_lineament is not None:
+            mean_dist = float(np.nanmean(distance_to_lineament[m]))
+            px_m = max(pixel_m)
+            # 距断裂近(平均距离 < 5 像元)
+            if mean_dist < 5 * px_m:
+                scores["fault_creep"] += 0.3
+            if mean_dist < 2 * px_m:
+                scores["fault_creep"] += 0.2
+
+        # 长轴方向与断裂走向一致
+        long_axis = cl.get("long_axis_deg")
+        strike_diff = cl.get("strike_diff_deg")
+        if strike_diff is not None:
+            if strike_diff < 30:
+                scores["fault_creep"] += 0.3
+            elif strike_diff < 45:
+                scores["fault_creep"] += 0.15
+
+        # 形变线性体走向与沉降簇重叠(交叉验证)
+        if defm_segments and cl.get("boundary"):
+            # 简化: 检查是否有形变线性体经过沉降簇附近
+            inv = ~transform
+            n_nearby = 0
+            nearby_strikes = []
+            for seg in defm_segments:
+                c0, r0 = inv * seg["p0"]
+                c1, r1 = inv * seg["p1"]
+                mid_c, mid_r = (c0 + c1) / 2, (r0 + r1) / 2
+                if m[int(np.clip(mid_r, 0, H-1)), int(np.clip(mid_c, 0, W-1))]:
+                    n_nearby += 1
+                    nearby_strikes.append(seg.get("strike_deg", 0))
+            if n_nearby > 0:
+                scores["fault_creep"] += 0.2
+                # 形变线性体走向与长轴一致
+                if long_axis is not None and nearby_strikes:
+                    for s in nearby_strikes:
+                        diff = min(abs(long_axis - s), 180 - abs(long_axis - s))
+                        if diff < 30:
+                            scores["fault_creep"] += 0.1
+                            break
+
+        # ---- 归因决策 ----
+        best_class = max(scores, key=scores.get)
+        best_score = scores[best_class]
+
+        if best_score < 0.3:
+            attribution = "undetermined"
+            confidence = best_score / 0.3  # 归一化到 [0,1)
+        else:
+            attribution = best_class
+            confidence = min(1.0, best_score)
+
+        cl["attribution_class"] = attribution
+        cl["attribution_confidence"] = round(float(confidence), 3)
+        cl["attribution_scores"] = {k: round(v, 3) for k, v in scores.items()}
+
+        # 写入栅格
+        attr_code = {"goaf": 1, "landslide": 2, "fault_creep": 3}.get(attribution, 9)
+        attr_raster[m] = attr_code
+
+    return attr_raster, clusters
 
 
 # ---------------------------------------------------------------------------
@@ -364,8 +727,26 @@ def _write_line_geojson(records, path, crs_str):
 def _write_point_geojson(clusters, path, crs_str):
     feats = [{"type": "Feature",
               "geometry": {"type": "Point", "coordinates": c["centroid"]},
-              "properties": {k: v for k, v in c.items() if k != "centroid"}}
+              "properties": {k: v for k, v in c.items() if k not in ("centroid", "boundary")}}
              for c in clusters]
+    fc = {"type": "FeatureCollection",
+          "crs": {"type": "name", "properties": {"name": crs_str}}, "features": feats}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(fc, f, ensure_ascii=False)
+
+
+def _write_polygon_geojson(clusters, path, crs_str):
+    """沉降漏斗多边形(凸包)→ GeoJSON。"""
+    feats = []
+    for c in clusters:
+        boundary = c.get("boundary")
+        if boundary is None:
+            continue
+        props = {k: v for k, v in c.items()
+                 if k not in ("centroid", "boundary")}
+        feats.append({"type": "Feature",
+                      "geometry": {"type": "Polygon", "coordinates": [boundary]},
+                      "properties": props})
     fc = {"type": "FeatureCollection",
           "crs": {"type": "name", "properties": {"name": crs_str}}, "features": feats}
     with open(path, "w", encoding="utf-8") as f:
@@ -588,6 +969,71 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
         clusters, sub_lbl, sub_thr = detect_subsidence(velm, valid, transform, pixel_m)
         subsidence_field = "los"
 
+    # B3 沉降漏斗多边形圈定 + 长轴分析
+    topo_strikes = topo["stats"].get("dominant_strikes_deg", [])
+    if clusters:
+        clusters = delineate_goaf_polygons(
+            clusters, sub_lbl, velm, transform, pixel_m, topo_strikes=topo_strikes)
+        logger.info(f"[insar_fusion] B3: {sum(1 for c in clusters if c.get('boundary'))} 个多边形圈定")
+        for cl in clusters:
+            if cl.get("long_axis_deg") is not None:
+                logger.info(f"  簇{cl['id']}: 长轴 {cl['long_axis_deg']}°, "
+                            f"与断裂差 {cl.get('strike_diff_deg', 'N/A')}°, "
+                            f"面积 {cl['area_m2']:.0f} m²")
+
+    # B4 沉降时序分类
+    ts_array = data.get("ts")
+    ts_dates = data.get("dates", [])
+    if clusters:
+        clusters = classify_subsidence_timeseries(clusters, sub_lbl, ts_array, ts_dates)
+        ts_summary = {}
+        for cl in clusters:
+            cls = cl.get("ts_class", "no_data")
+            ts_summary[cls] = ts_summary.get(cls, 0) + 1
+        logger.info(f"[insar_fusion] B4: 时序分类 {ts_summary}")
+
+    # C线 形变归因
+    attr_raster = np.zeros((H, W), dtype=np.int8)
+    if clusters:
+        # 准备地形辅助数据
+        slope_for_attr = None
+        aspect_for_attr = None
+        dist_for_attr = None
+        if dem is not None:
+            try:
+                slope_for_attr = TerrainProcessor.compute_slope(dem, pixel_m)
+                aspect_for_attr = TerrainProcessor.compute_aspect(dem, pixel_m)
+            except Exception:
+                pass
+        if topo.get("distance_m") is not None and not np.all(np.isnan(topo["distance_m"])):
+            dist_for_attr = topo["distance_m"]
+        elif structural_dir:
+            # 尝试从 geo-stru 产物读取距离栅格
+            dist_path = os.path.join(structural_dir, "distance_to_lineament.tif")
+            if os.path.exists(dist_path):
+                try:
+                    with rasterio.open(dist_path) as src:
+                        dist_for_attr = src.read(1).astype(np.float64)
+                        # 尺寸对齐
+                        if dist_for_attr.shape != (H, W):
+                            from scipy.ndimage import zoom
+                            zh, zw = H / dist_for_attr.shape[0], W / dist_for_attr.shape[1]
+                            dist_for_attr = zoom(np.nan_to_num(dist_for_attr, nan=1e6), (zh, zw))
+                            dist_for_attr = dist_for_attr[:H, :W]
+                except Exception:
+                    pass
+
+        attr_raster, clusters = attribute_deformation(
+            clusters, sub_lbl, velm, valid, transform, pixel_m,
+            defm_segments=defm["segments"],
+            slope=slope_for_attr, aspect=aspect_for_attr,
+            distance_to_lineament=dist_for_attr)
+        attr_summary = {}
+        for cl in clusters:
+            cls = cl.get("attribution_class", "undetermined")
+            attr_summary[cls] = attr_summary.get(cls, 0) + 1
+        logger.info(f"[insar_fusion] C线 归因: {attr_summary}")
+
     # C 东西向形变线性体 (如果有 2D 分解)
     ew_defm, ew_grad = None, None
     if has_ew := (ew is not None):
@@ -603,6 +1049,9 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
         _write_gtiff(os.path.join(out_dir, "ew_velocity_mm_yr.tif"),
                      np.where(np.isfinite(ew), ew, np.nan), transform, epsg)
     _write_gtiff(os.path.join(out_dir, "velocity_gradient.tif"), grad, transform, epsg)
+    # C线: 归因栅格 (始终落盘,无簇时为全零)
+    _write_gtiff(os.path.join(out_dir, "deformation_attribution.tif"),
+                 attr_raster.astype("float32"), transform, epsg, nodata=0)
 
     # ---- 落盘矢量 ----
     lineament.write_lineaments_geojson(defm["segments"],
@@ -612,6 +1061,10 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
                                            os.path.join(out_dir, "topographic_lineaments.geojson"), crs=crs_str)
     _write_line_geojson(activity, os.path.join(out_dir, "lineaments_activity.geojson"), crs_str)
     _write_point_geojson(clusters, os.path.join(out_dir, "subsidence_clusters.geojson"), crs_str)
+    # B3: goaf 多边形
+    _write_polygon_geojson(clusters, os.path.join(out_dir, "goaf_polygons.geojson"), crs_str)
+    # C线: 归因矢量(每个簇含 attribution_class + confidence; 无簇时空 FC)
+    _write_point_geojson(clusters, os.path.join(out_dir, "deformation_attribution.geojson"), crs_str)
     lineament.plot_rose_diagram(topo["segments"], os.path.join(out_dir, "rose_topographic.png"), "Topographic strikes")
     lineament.plot_rose_diagram(defm["segments"], os.path.join(out_dir, "rose_deformation.png"), "Deformation strikes")
     if ew_defm and ew_defm.get("segments"):
@@ -627,6 +1080,9 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
         "topographic_lineaments_geojson": "topographic_lineaments.geojson",
         "lineaments_activity_geojson": "lineaments_activity.geojson",
         "subsidence_clusters_geojson": "subsidence_clusters.geojson",
+        "goaf_polygons_geojson": "goaf_polygons.geojson",
+        "deformation_attribution_tif": "deformation_attribution.tif",
+        "deformation_attribution_geojson": "deformation_attribution.geojson",
         "rose_topographic_png": "rose_topographic.png",
         "rose_deformation_png": "rose_deformation.png",
     }
@@ -690,8 +1146,35 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
             "n_subsidence_clusters": len(clusters),
             "subsidence_threshold_mm_yr": round(sub_thr, 2),
             "subsidence_field": subsidence_field,
+            "subsidence_details": [
+                {
+                    "id": c["id"],
+                    "area_m2": c.get("area_m2"),
+                    "mean_vel_mm_yr": c.get("mean_vel_mm_yr"),
+                    "long_axis_deg": c.get("long_axis_deg"),
+                    "strike_diff_deg": c.get("strike_diff_deg"),
+                    "ts_class": c.get("ts_class", "no_data"),
+                    "ts_rate_mm_yr": c.get("ts_rate_mm_yr"),
+                }
+                for c in clusters
+            ] if clusters else [],
             "n_ew_deformation_lineaments": len(ew_defm["segments"]) if ew_defm else 0,
             "ew_dominant_strikes_deg": ew_defm["stats"]["dominant_strikes_deg"] if ew_defm else [],
+            "attribution_summary": {
+                cl.get("attribution_class", "undetermined"): sum(
+                    1 for c in clusters if c.get("attribution_class") == cl.get("attribution_class")
+                )
+                for cl in clusters
+            } if clusters else {},
+            "attribution_details": [
+                {
+                    "id": c["id"],
+                    "attribution_class": c.get("attribution_class", "undetermined"),
+                    "attribution_confidence": c.get("attribution_confidence", 0),
+                    "attribution_scores": c.get("attribution_scores", {}),
+                }
+                for c in clusters
+            ] if clusters else [],
             "signal_quality": signal_quality,
         },
         "data_caveat": (
@@ -701,6 +1184,38 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
         ),
         "created_at": created_at or datetime.now().isoformat(timespec="seconds"),
     }
+
+    # ---- 矿床类型构造推理 ----
+    try:
+        from core.deposit_inference import infer_deposit_type
+        # 构造 structural_stats
+        fusion_structural_stats = {
+            "n_lineaments": topo["stats"]["n_lineaments"],
+            "lineament_density_mean": topo["stats"]["density_mean"],
+            "dominant_strikes_deg": topo["stats"]["dominant_strikes_deg"],
+            "elevation_range_m": [float(np.nanmin(dem)), float(np.nanmax(dem))]
+            if dem is not None else [0, 9999],
+        }
+        # 归因统计
+        attr_stats = {}
+        for cl in clusters:
+            cls = cl.get("attribution_class", "undetermined")
+            attr_stats[cls] = attr_stats.get(cls, 0) + 1
+        metadata["deposit_inference"] = infer_deposit_type(
+            structural_stats=fusion_structural_stats,
+            attribution_stats=attr_stats,
+            lineament_details=topo.get("segments"),
+        )
+    except Exception as e:
+        logger.warning(f"矿床类型推理失败(非致命): {e}")
+
+    # 校验 metadata 字段完整性
+    try:
+        from core.structural_engine import _validate_metadata
+        _validate_metadata(metadata)
+    except Exception as e:
+        logger.warning(f"metadata schema 校验失败(非致命): {e}")
+
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
