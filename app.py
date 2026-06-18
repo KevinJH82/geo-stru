@@ -19,6 +19,15 @@ from core import delivery
 from utils.file_utils import get_file_size
 
 app = Flask(__name__)
+# ── 内部鉴权:拒绝绕过 BFF 的直连(PORTAL_INTERNAL_KEY 配置后生效) ──
+try:
+    import sys as _ia_sys
+    if '/opt/deepexplor-services' not in _ia_sys.path:
+        _ia_sys.path.insert(0, '/opt/deepexplor-services')
+    from commons.internal_auth import init_internal_auth as _init_internal_auth
+    _init_internal_auth(app)
+except Exception as _ia_e:
+    print(f'[internal_auth] 跳过接入: {_ia_e}')
 app.secret_key = Config.SECRET_KEY
 app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
 
@@ -274,6 +283,9 @@ def start_generation():
             return jsonify({'success': False,
                             'message': f'交付项目「{os.path.basename(str(project_dir))}」冬季子目录无 DEM.tif,无法生成构造解译图'})
 
+        # 租户上下文:BFF 经 /svc 注入 X-Tenant-Id;线程内无 request 上下文,先在此捕获
+        tenant_id = request.headers.get('X-Tenant-Id')
+
         task_id = f"struct_{task_counter:04d}"
         task_counter += 1
 
@@ -316,6 +328,7 @@ def start_generation():
                     log_callback=on_log,
                     aoi_name=aoi_name,
                     mineral_hint=params.get('mineral_hint'),
+                    tenant_id=tenant_id,
                 )
 
                 analysis_tasks[task_id]['status'] = 'completed'

@@ -229,6 +229,7 @@ class StructuralEngine:
         created_at: Optional[str] = None,
         mineral_hint: Optional[str] = None,
         trace_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict:
         """
         生成三类遥感地质构造解译图
@@ -504,7 +505,7 @@ class StructuralEngine:
         # 决策轨迹血缘三键（容错，不影响产物）：显式 trace_id 优先 → 自生成（stru 多为叶子证据源）
         try:
             from commons.trace import stamp_metadata
-            stamp_metadata(metadata, explicit_trace_id=trace_id)
+            stamp_metadata(metadata, explicit_trace_id=trace_id, tenant_id=tenant_id)
         except Exception:
             pass
 

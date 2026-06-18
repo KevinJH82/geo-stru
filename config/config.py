@@ -7,7 +7,7 @@ class Config:
     HOST = '0.0.0.0'
     PORT = 8082
     DEBUG = True
-    SECRET_KEY = 'structural-interpretation-secret-key-2024'
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'structural-interpretation-secret-key-2024')
 
     MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB
 
