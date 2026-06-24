@@ -158,6 +158,44 @@ _HARDCODED_MAP = {
 DEPOSIT_RULES, COMMODITY_MAP = _get_rules_and_map()
 
 
+# 项目名/AOI 名关键词 → 矿种代码(commodity code,与 COMMODITY_MAP 键一致)。
+# 按"先具体后宽泛"顺序匹配,首个命中即返回;避免 "多金属" 被 "金" 误匹配等问题。
+NAME_HINT_KEYWORDS = [
+    ("页岩气", "shale_gas"),
+    ("煤层气", "coalbed_gas"),
+    ("多金属", "polymetallic"),
+    ("金属", "polymetallic"),
+    ("石油", "petroleum"),
+    ("油气", "petroleum"),
+    ("天然气", "gas"),
+    ("煤", "coal"),
+    ("铜", "copper"),
+    ("铁", "iron"),
+    ("钼", "molybdenum"),
+    ("钨", "tungsten"),
+    ("铅", "lead"),
+    ("锌", "zinc"),
+    ("铝土", "bauxite"),
+    ("盐", "salt"),
+    ("金", "gold"),
+]
+
+
+def infer_mineral_hint_from_name(name: Optional[str]) -> Optional[str]:
+    """从项目名/AOI 名按关键词推断矿种代码,无命中返回 None。
+
+    用于用户未显式选择矿种方向时的兜底引导:如项目名"测试油气"→"petroleum"。
+    返回值为 COMMODITY_MAP 键(英文代码),可直接作为 mineral_hint 传入 infer_deposit_type。
+    """
+    if not name:
+        return None
+    text = str(name).lower()
+    for kw, code in NAME_HINT_KEYWORDS:
+        if kw in name or kw in text:
+            return code
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 2. 辅助函数
 # ---------------------------------------------------------------------------

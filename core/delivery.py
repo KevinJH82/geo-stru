@@ -40,12 +40,13 @@ def list_projects() -> List[Dict[str, str]]:
         return []
 
 
-def resolve_project_dir(name_or_filename: str) -> Optional[Path]:
+def resolve_project_dir(name_or_filename: str, roi_geojson=None) -> Optional[Path]:
     """
     定位交付项目目录,兼容两种入参:
       - 项目名(下拉框传来,可能含小数点如 "...6.82km2_..."):优先按精确目录名匹配,
         避免 Path().stem 把 ".82km2_..." 误当扩展名;
       - ROI 文件名(如 "X.ovkml"):回退到 delivery_project 的取主名匹配。
+    roi_geojson(可选):给定则名字匹配失败时按几何覆盖兜底定位(KML 改名也能命中)。
     """
     if not name_or_filename:
         return None
@@ -54,9 +55,25 @@ def resolve_project_dir(name_or_filename: str) -> Optional[Path]:
         cand = dp.DELIVERY_ROOT / name_or_filename
         if cand.is_dir():
             return cand
-        return dp.resolve_project_dir(name_or_filename)
+        return dp.resolve_project_dir(name_or_filename, roi_geojson)
     except Exception:
         return None
+
+
+def resolve_project_dir_verbose(name_or_filename: str, roi_geojson=None, delivery_id: str = "") -> dict:
+    """返回 {dir, method, candidates, delivery_id},供未命中时列候选友好报错。
+
+    delivery_id(门户绑定):给定则优先按 ID 定位。
+    """
+    try:
+        dp = _load()
+        if not delivery_id:
+            cand = dp.DELIVERY_ROOT / (name_or_filename or "")
+            if cand.is_dir():
+                return {"dir": cand, "method": "exact", "candidates": []}
+        return dp.resolve_project_dir_verbose(name_or_filename, roi_geojson, delivery_id)
+    except Exception:
+        return {"dir": None, "method": "none", "candidates": []}
 
 
 def _find_dem(directory: Path) -> Optional[Path]:

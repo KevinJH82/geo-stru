@@ -445,6 +445,18 @@ function uploadArea(files) {
 // ==================== Generation ====================
 function startGeneration() {
     if (!areaFilePath || !projectName || !demAvailable) return;
+
+    // 漏选矿种方向时提醒:后端会按项目名兜底推断,但项目名无关键词则推理不受引导
+    const hintEl = document.getElementById('mineral_hint');
+    if (!hintEl.value) {
+        const proceed = confirm(
+            '未选择「矿种方向」。\n\n' +
+            '系统将尝试按项目名自动推断目标矿种;若项目名不含矿种关键词,' +
+            '矿床推断将不受目标引导(构造特征相近时可能偏向金属矿)。\n\n' +
+            '点击「确定」继续分析,或「取消」返回选择矿种方向。');
+        if (!proceed) return;
+    }
+
     const params = {
         project_name: projectName,
         file_path: areaFilePath,

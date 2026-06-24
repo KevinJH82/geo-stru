@@ -230,6 +230,7 @@ class StructuralEngine:
         mineral_hint: Optional[str] = None,
         trace_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        task_code: Optional[str] = None,
     ) -> Dict:
         """
         生成三类遥感地质构造解译图
@@ -454,6 +455,7 @@ class StructuralEngine:
             'source': 'geo-stru',
             'source_version': __version__,
             'run_id': os.path.basename(os.path.normpath(output_dir)),
+            'task_code': task_code or '',
             'aoi_name': aoi_name or '',
             'aoi_bbox': aoi_bbox,
             'crs': crs_str,

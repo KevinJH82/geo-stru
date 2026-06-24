@@ -871,7 +871,8 @@ def render_timeseries(out_dir, data, velm, sub_lbl):
 def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
                seed: int = DEFAULT_SEED, coh_thr: float = DEFAULT_COH_THR,
                make_plots: bool = True, created_at: Optional[str] = None,
-               structural_dir: Optional[str] = None) -> Dict:
+               structural_dir: Optional[str] = None,
+               task_code: Optional[str] = None) -> Dict:
     """
     端到端融合。自动检测数据格式 (MintPy h5 vs geo-insar TIF+npy)。
     如果有 2D 分解结果,用垂直速率做活动性/沉降,新增东西向线性体。
@@ -1119,6 +1120,7 @@ def run_fusion(insar_dir: str, out_dir: str, aoi_name: Optional[str] = None,
     metadata = {
         "source": SOURCE, "source_version": VERSION,
         "run_id": os.path.basename(os.path.normpath(out_dir)),
+        "task_code": task_code or "",
         "aoi_name": aoi_name or Path(insar_dir).name,
         "aoi_bbox": [round(x, 6) for x in bbox_ll],
         "crs": crs_str, "grid": [H, W], "pixel_size_m": list(pixel_m),
