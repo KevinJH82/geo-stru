@@ -146,6 +146,21 @@
                     <input id="use_landsat" type="checkbox" checked class="rounded border-slate-300 text-blue-600">
                     叠加 Landsat 真彩色
                 </label>
+                <div>
+                    <label class="text-xs text-slate-500 block mb-1">矿种方向 (可选,引导矿床推理)</label>
+                    <select id="mineral_hint" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none">
+                        <option value="">不限定</option>
+                        <option value="gold">金 (Au)</option>
+                        <option value="copper">铜 (Cu)</option>
+                        <option value="iron">铁 (Fe)</option>
+                        <option value="petroleum">石油/油气</option>
+                        <option value="gas">天然气</option>
+                        <option value="coal">煤炭/煤层气</option>
+                        <option value="polymetallic">多金属</option>
+                        <option value="molybdenum">钼 (Mo)</option>
+                        <option value="tungsten">钨 (W)</option>
+                    </select>
+                </div>
             </div>
         </section>
 
@@ -164,6 +179,21 @@
 
     <!-- Main Content -->
     <main class="flex-1 p-6 flex flex-col gap-5 overflow-y-auto">
+
+        <!-- History Panel -->
+        <div id="history_section">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                    <iconify-icon icon="lucide:history" width="15"></iconify-icon> 历史分析记录
+                </h2>
+                <button onclick="loadHistory()" class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1">
+                    <iconify-icon icon="lucide:refresh-cw" width="12"></iconify-icon> 刷新
+                </button>
+            </div>
+            <div id="history_list" class="space-y-2 text-sm">
+                <div class="text-xs text-slate-400">加载中...</div>
+            </div>
+        </div>
 
         <!-- Progress -->
         <div id="progress_section" class="hidden">
@@ -193,6 +223,9 @@
                 </button>
                 <button class="tab-btn" data-tab="tab_e" onclick="switchTab(this)">
                     <iconify-icon icon="lucide:grid-2x2" width="14" class="mr-1"></iconify-icon> 衍生栅格
+                </button>
+                <button class="tab-btn" data-tab="tab_f" onclick="switchTab(this)">
+                    <iconify-icon icon="lucide:gem" width="14" class="mr-1"></iconify-icon> 矿床推理
                 </button>
             </div>
             <div id="tab_a" class="tab-content">
@@ -246,6 +279,36 @@
                 </div>
                 <div id="deriv_grid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">—</div>
                 <div id="vector_dl" class="mt-4 text-sm"></div>
+            </div>
+            <div id="tab_f" class="tab-content hidden">
+                <div class="text-xs text-slate-400 mb-3">
+                    基于构造特征(断裂走向/密度/地形/形变归因)的矿床类型推理。纯构造间接推理，需蚀变/地球化学等多源信息验证。
+                </div>
+                <div id="deposit_primary" class="mb-4 hidden">
+                    <div class="bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 rounded-lg p-4">
+                        <div class="flex items-center gap-2 mb-1">
+                            <iconify-icon icon="lucide:gem" width="18" class="text-amber-600"></iconify-icon>
+                            <span class="font-semibold text-amber-800 text-base" id="deposit_primary_name">—</span>
+                            <span id="deposit_hint_badge" class="hidden text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full"></span>
+                        </div>
+                        <div class="flex items-center gap-3 mb-2">
+                            <span class="text-xs text-amber-600">置信度</span>
+                            <div class="flex-1 bg-amber-100 rounded-full h-2">
+                                <div id="deposit_conf_bar" class="bg-amber-500 h-2 rounded-full transition-all" style="width:0%"></div>
+                            </div>
+                            <span class="text-sm font-medium text-amber-700" id="deposit_primary_conf">0</span>
+                        </div>
+                        <div class="text-sm text-amber-700" id="deposit_primary_desc"></div>
+                    </div>
+                </div>
+                <div class="mb-4">
+                    <div class="text-sm font-semibold text-slate-700 mb-2">构造控矿综合评述</div>
+                    <div id="deposit_summary" class="text-sm text-slate-600 bg-slate-50 rounded-lg p-3">—</div>
+                </div>
+                <div>
+                    <div class="text-sm font-semibold text-slate-700 mb-2">候选矿床类型</div>
+                    <div id="deposit_candidates" class="space-y-2">—</div>
+                </div>
             </div>
         </div>
 
@@ -382,12 +445,25 @@ function uploadArea(files) {
 // ==================== Generation ====================
 function startGeneration() {
     if (!areaFilePath || !projectName || !demAvailable) return;
+
+    // 漏选矿种方向时提醒:后端会按项目名兜底推断,但项目名无关键词则推理不受引导
+    const hintEl = document.getElementById('mineral_hint');
+    if (!hintEl.value) {
+        const proceed = confirm(
+            '未选择「矿种方向」。\n\n' +
+            '系统将尝试按项目名自动推断目标矿种;若项目名不含矿种关键词,' +
+            '矿床推断将不受目标引导(构造特征相近时可能偏向金属矿)。\n\n' +
+            '点击「确定」继续分析,或「取消」返回选择矿种方向。');
+        if (!proceed) return;
+    }
+
     const params = {
         project_name: projectName,
         file_path: areaFilePath,
         azimuth: parseFloat(document.getElementById('azimuth').value) || 315,
         altitude: parseFloat(document.getElementById('altitude').value) || 30,
-        use_landsat: document.getElementById('use_landsat').checked
+        use_landsat: document.getElementById('use_landsat').checked,
+        mineral_hint: document.getElementById('mineral_hint').value || null
     };
 
     document.getElementById('run_btn').disabled = true;
@@ -524,6 +600,64 @@ function renderDerivatives(results, base) {
     } else {
         vdl.innerHTML = '';
     }
+
+    // 矿床类型推理
+    renderDepositInference(results);
+}
+
+function renderDepositInference(results) {
+    const di = results.deposit_inference;
+    const primaryDiv = document.getElementById('deposit_primary');
+    if (!di || !di.primary_model) {
+        primaryDiv.classList.add('hidden');
+        document.getElementById('deposit_summary').textContent = '构造数据不足以进行矿床推理。';
+        document.getElementById('deposit_candidates').innerHTML = '<div class="text-xs text-slate-400">无推理结果。</div>';
+        return;
+    }
+    // 主结果卡片
+    primaryDiv.classList.remove('hidden');
+    document.getElementById('deposit_primary_name').textContent = di.primary_model;
+    // 矿种方向 badge
+    const hintBadge = document.getElementById('deposit_hint_badge');
+    if (di.mineral_hint) {
+        hintBadge.textContent = '方向: ' + di.mineral_hint;
+        hintBadge.classList.remove('hidden');
+    } else {
+        hintBadge.classList.add('hidden');
+    }
+    const conf = Math.round(di.primary_confidence * 100);
+    document.getElementById('deposit_primary_conf').textContent = conf + '%';
+    document.getElementById('deposit_conf_bar').style.width = conf + '%';
+    const cands = di.candidates || [];
+    const primary = cands.find(c => c.deposit_type === di.primary_model) || {};
+    document.getElementById('deposit_primary_desc').textContent =
+        (primary.control_model ? '控矿模式: ' + primary.control_model + '。' : '') +
+        (primary.description || '');
+
+    // 综合评述
+    document.getElementById('deposit_summary').textContent = di.structural_control_summary || '—';
+
+    // 候选列表
+    const el = document.getElementById('deposit_candidates');
+    el.innerHTML = cands.map((c, i) => {
+        const pct = Math.round(c.confidence * 100);
+        const isTop = c.deposit_type === di.primary_model;
+        const barColor = isTop ? 'bg-amber-400' : 'bg-slate-300';
+        const badge = isTop ? '<span class="ml-2 text-xs bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">首选</span>' : '';
+        return `
+        <div class="border ${isTop ? 'border-amber-200 bg-amber-50/30' : 'border-slate-100'} rounded-lg p-3">
+            <div class="flex items-center justify-between mb-1">
+                <span class="text-sm font-medium ${isTop ? 'text-amber-800' : 'text-slate-700'}">${c.deposit_type}${badge}</span>
+                <span class="text-xs text-slate-500">${pct}%</span>
+            </div>
+            <div class="flex items-center gap-2 mb-1.5">
+                <div class="flex-1 bg-slate-100 rounded-full h-1.5">
+                    <div class="${barColor} h-1.5 rounded-full" style="width:${pct}%"></div>
+                </div>
+            </div>
+            <div class="text-xs text-slate-500">${c.evidence ? c.evidence.join('；') : ''}</div>
+        </div>`;
+    }).join('');
 }
 
 // ==================== UI Helpers ====================
@@ -580,6 +714,60 @@ function clearAll() {
     setStatus('idle', '就绪');
     document.getElementById('area_input').value = '';
 }
+
+// ==================== History ====================
+function loadHistory() {
+    const box = document.getElementById('history_list');
+    box.innerHTML = '<div class="text-xs text-slate-400">加载中...</div>';
+    fetch('/api/history').then(r => r.json()).then(data => {
+        if (!data.success || !data.records.length) {
+            box.innerHTML = '<div class="text-xs text-slate-400">暂无历史分析记录。完成分析后将自动出现在此。</div>';
+            return;
+        }
+        box.innerHTML = data.records.map(r => {
+            const di = r.deposit_inference;
+            const depositTag = di && di.primary_model
+                ? `<span class="text-xs bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">${di.primary_model}</span>`
+                : '';
+            const catLabel = r.category === 'insar_fusion' ? 'InSAR融合' : '构造解译';
+            const catColor = r.category === 'insar_fusion' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700';
+            return `
+            <div class="border border-slate-200 rounded-lg p-3 flex items-center justify-between hover:bg-slate-50 transition cursor-pointer"
+                 onclick="loadHistoryResult('${r.result_dir}', '${r.metadata_path}')">
+                <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="text-xs ${catColor} px-1.5 py-0.5 rounded font-medium">${catLabel}</span>
+                        <span class="text-sm font-medium text-slate-700 truncate">${r.aoi_name}</span>
+                        ${depositTag}
+                    </div>
+                    <div class="text-xs text-slate-400">
+                        ${r.run_id || ''} · ${r.created_at || ''} · ${r.n_products || 0} 个产物
+                    </div>
+                </div>
+                <iconify-icon icon="lucide:chevron-right" width="16" class="text-slate-300 shrink-0"></iconify-icon>
+            </div>`;
+        }).join('');
+    }).catch(() => {
+        box.innerHTML = '<div class="text-xs text-red-400">加载失败</div>';
+    });
+}
+
+function loadHistoryResult(resultDir, metadataPath) {
+    // 从历史 metadata.json 读取结果,加载到当前结果面板
+    fetch('/api/history_result?metadata_path=' + encodeURIComponent(metadataPath) + '&result_dir=' + encodeURIComponent(resultDir))
+        .then(r => r.json())
+        .then(data => {
+            if (!data.success) { addLog('加载历史结果失败: ' + data.message, 'error'); return; }
+            taskId = data.results.task_id;
+            showResults(data.results);
+            document.getElementById('history_section').classList.add('hidden');
+            addLog('已加载历史分析: ' + (data.results.aoi_name || ''), 'success');
+        })
+        .catch(err => addLog('加载历史结果错误: ' + err.message, 'error'));
+}
+
+// 页面加载时获取历史
+loadHistory();
 </script>
 </body>
 </html>

@@ -15,13 +15,41 @@ import zipfile
 import tempfile
 import rasterio
 from datetime import datetime
+from loguru import logger
 from rasterio.transform import Affine
 from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 
+from config import __version__
 from core.terrain_utils import TerrainProcessor
 from core.structural_map_viz import StructuralMapVisualizer
 from core import lineament
+
+
+# ---------------------------------------------------------------------------
+# metadata.json schema 校验
+# ---------------------------------------------------------------------------
+_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "commons" / "structural_schema.json"
+
+
+def _validate_metadata(metadata: dict) -> None:
+    """
+    用 structural_schema.json 校验 metadata 字段完整性。
+    校验失败只打警告不阻断——避免阻塞产物落盘。
+    """
+    try:
+        import jsonschema
+        if not _SCHEMA_PATH.exists():
+            logger.warning(f"schema 文件不存在,跳过校验: {_SCHEMA_PATH}")
+            return
+        with open(_SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        jsonschema.validate(instance=metadata, schema=schema)
+        logger.debug("metadata.json schema 校验通过")
+    except ImportError:
+        pass  # jsonschema 不可用,跳过
+    except Exception as e:
+        logger.warning(f"metadata.json schema 校验失败(非致命): {e}")
 
 # 复用平台共享的 AOI 解析:按文件路径 importlib 加载 commons/aoi.py,真正零污染。
 # 关键:*不*把仓库根插入 sys.path —— 否则 Flask 调试重载器(StatReloader 会
@@ -199,6 +227,10 @@ class StructuralEngine:
         log_callback=None,
         aoi_name: Optional[str] = None,
         created_at: Optional[str] = None,
+        mineral_hint: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        task_code: Optional[str] = None,
     ) -> Dict:
         """
         生成三类遥感地质构造解译图
@@ -274,28 +306,56 @@ class StructuralEngine:
 
         landsat_rgb = None
         if use_landsat and landsat_dir and os.path.isdir(landsat_dir):
-            # 地质制图优先用 SWIR 组合(L8 7-6-4 = SWIR2/SWIR1/Red),突出岩性与蚀变;
-            # 缺 SWIR 波段时回退真彩色 4-3-2(纯视觉)。
-            band_combos = [['B7', 'B6', 'B4'], ['B4', 'B3', 'B2']]
-            for combo in band_combos:
-                if not all(os.path.exists(os.path.join(landsat_dir, f"{b}.tif")) for b in combo):
+            # 波段发现:兼容多种文件命名(B7.tif / B07.tif / SR_B7.TIF / B7_30m.tif 等)
+            def _resolve_band(band_name, directory):
+                """模糊匹配波段文件(不区分大小写,支持前缀/后缀变体)。"""
+                bn = band_name.lower()
+                for f in sorted(os.listdir(directory)):
+                    fl = f.lower()
+                    if not fl.endswith(('.tif', '.tiff')):
+                        continue
+                    # 精确: B7.tif
+                    if fl == f'{bn}.tif' or fl == f'{bn}.tiff':
+                        return os.path.join(directory, f)
+                    # 前缀: B07.tif, SR_B7.tif
+                    stem = fl.replace('.tif', '').replace('.tiff', '')
+                    if stem == bn or stem.endswith(bn) or stem.startswith(bn):
+                        return os.path.join(directory, f)
+                    # 数字匹配: B07 → B7
+                    try:
+                        num = bn.lstrip('b')
+                        if num and (stem == f'b{int(num):02d}' or stem.endswith(f'b{int(num):02d}')):
+                            return os.path.join(directory, f)
+                    except ValueError:
+                        pass
+                return None
+
+            # 组合优先级: SWIR地质 > 真彩色; Landsat > S2
+            combos = [
+                (['B7', 'B6', 'B4'], 'Landsat SWIR 7-6-4'),
+                (['B4', 'B3', 'B2'], 'Landsat 真彩色 4-3-2'),
+                (['B12', 'B11', 'B8A'], 'Sentinel-2 SWIR 12-11-8A'),
+                (['B11', 'B8A', 'B04'], 'Sentinel-2 短波 11-8A-4'),
+            ]
+            for combo, label in combos:
+                paths = [_resolve_band(b, landsat_dir) for b in combo]
+                if not all(paths):
                     continue
                 tag = '-'.join(b[1:] for b in combo)
-                log(f"加载 Landsat 波段组合 {tag}({'SWIR地质' if combo[0]=='B7' else '真彩色'})并重投影...")
+                log(f"加载波段组合 {label} 并重投影...")
                 try:
                     rgb_bands = [
                         TerrainProcessor.percent_stretch(
                             TerrainProcessor.resample_to_dem_grid(
-                                os.path.join(landsat_dir, f"{b}.tif"),
-                                transform_clipped, dem_crs, dem_clipped.shape), 2)
-                        for b in combo
+                                p, transform_clipped, dem_crs, dem_clipped.shape), 2)
+                        for p in paths
                     ]
                     landsat_rgb = np.stack(rgb_bands, axis=-1)
                 except Exception as e:
-                    log(f"Landsat加载失败: {e}，使用纯地形渲染", 'WARNING')
+                    log(f"波段加载失败: {e}，尝试下一组合", 'WARNING')
                 break
             else:
-                log("未找到可用 Landsat 波段组合(SWIR/真彩色),使用纯地形渲染", 'WARNING')
+                log("未找到可用的 Landsat/S2 波段组合,使用纯地形渲染", 'WARNING')
 
         log("计算地形渲染...")
         terrain_render = TerrainProcessor.compute_terrain_render(
@@ -393,8 +453,9 @@ class StructuralEngine:
         crs_str = dem_crs.to_string() if dem_crs is not None else "EPSG:4326"
         metadata = {
             'source': 'geo-stru',
-            'source_version': '1.0',
+            'source_version': __version__,
             'run_id': os.path.basename(os.path.normpath(output_dir)),
+            'task_code': task_code or '',
             'aoi_name': aoi_name or '',
             'aoi_bbox': aoi_bbox,
             'crs': crs_str,
@@ -422,6 +483,34 @@ class StructuralEngine:
             },
             'created_at': created_at or datetime.now().isoformat(timespec='seconds'),
         }
+
+        # ---- 矿床类型构造推理 ----
+        try:
+            from core.deposit_inference import infer_deposit_type, _extract_terrain_stats
+            terrain_stats = _extract_terrain_stats(dem_clipped, slope, svf, curvature)
+            deposit_result = infer_deposit_type(
+                structural_stats=metadata['structural_stats'],
+                terrain_stats=terrain_stats,
+                lineament_details=lin.get('segments'),
+                mineral_hint=mineral_hint,
+            )
+            metadata['deposit_inference'] = deposit_result
+            primary = deposit_result.get('primary_model', '未确定')
+            conf = deposit_result.get('primary_confidence', 0)
+            log(f"矿床类型推理: {primary} (置信度 {conf:.2f})")
+        except Exception as e:
+            log(f"矿床类型推理失败(非致命): {e}", 'WARNING')
+
+        # 校验 metadata 字段完整性（先校验原始字段，再注入轨迹键，避免触动 schema 校验）
+        _validate_metadata(metadata)
+
+        # 决策轨迹血缘三键（容错，不影响产物）：显式 trace_id 优先 → 自生成（stru 多为叶子证据源）
+        try:
+            from commons.trace import stamp_metadata
+            stamp_metadata(metadata, explicit_trace_id=trace_id, tenant_id=tenant_id)
+        except Exception:
+            pass
+
         metadata_path = os.path.join(output_dir, 'metadata.json')
         with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -438,6 +527,7 @@ class StructuralEngine:
             'metadata_path': metadata_path,
             'products': metadata['products'],
             'structural_stats': metadata['structural_stats'],
+            'deposit_inference': metadata.get('deposit_inference'),
             'aoi_name': aoi_name or '',
             'aoi_bbox': aoi_bbox,
             'polygon_coords': [(float(lo), float(la)) for lo, la in polygon_coords],
